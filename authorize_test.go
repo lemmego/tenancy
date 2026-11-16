@@ -48,7 +48,8 @@ func (f *fakeRegistry) IsMember(_ context.Context, workspaceID string, p Princip
 
 type user string
 
-func (u user) PrincipalKey() string { return string(u) }
+func (u user) PrincipalKind() string { return "user" }
+func (u user) PrincipalKey() string  { return string(u) }
 
 func headerIdent(value string, kind Kind) Identification {
 	return Identification{Workspace: Identifier{Kind: kind, Value: value, Source: SourceHeader}}

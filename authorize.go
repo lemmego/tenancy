@@ -60,8 +60,17 @@ type Workspace struct {
 // them. Opaque here on purpose: this package must not learn what a password
 // is, or whether the caller is a person, a device or a machine token.
 type Principal interface {
-	// PrincipalKey identifies the caller within one workspace. Two different
-	// strings are two different callers.
+	// PrincipalKind says which population the caller belongs to: "user" for
+	// a member of a workspace, "superuser" for a customer on the console,
+	// "sysadmin" for platform staff.
+	//
+	// It exists because membership means a different query for each, and
+	// because a bare key would otherwise be ambiguous: user 42 and superuser
+	// 42 are different people, and a store that compared only the key would
+	// one day treat them as the same.
+	PrincipalKind() string
+
+	// PrincipalKey identifies the caller within that population.
 	PrincipalKey() string
 }
 
