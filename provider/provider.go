@@ -41,6 +41,7 @@ type contextKey int
 
 const (
 	keyIdentification contextKey = iota
+	keySelected
 	keyBinding
 	keyTx
 )
@@ -142,8 +143,44 @@ func (p *Provider) resolve() app.HTTPMiddleware {
 				return
 			}
 
-			next.ServeHTTP(w, r.WithContext(
-				context.WithValue(r.Context(), keyIdentification, identification)))
+			ctx := context.WithValue(r.Context(), keyIdentification, identification)
+
+			// Resolve the host to a workspace here, before authentication.
+			//
+			// Not an optimisation. The users table is scoped to a workspace,
+			// so looking a user up with no workspace bound finds nobody —
+			// and authentication runs before Scoped, because Scoped needs
+			// the user it would produce. Selecting the workspace from the
+			// host breaks that circle: the host is not a claim about
+			// identity, so resolving it needs no principal.
+			//
+			// Only for a host. A header-named workspace stays unresolved
+			// until Scoped, where a non-member and a nonexistent workspace
+			// answer identically — resolving it here would answer 404 for
+			// one and something else for the other, which is the
+			// enumeration oracle this design exists to avoid.
+			if identification.Workspace.Source == tenancy.SourceHost {
+				workspace, err := tenancy.Select(ctx, p.Registry, identification)
+				switch {
+				case err == nil:
+					ctx = context.WithValue(ctx, keySelected, workspace)
+				case errors.Is(err, tenancy.ErrNoWorkspace):
+					// An unknown subdomain, which is what it genuinely is.
+					http.NotFound(w, r)
+					return
+				default:
+					// A registry failure is NOT a 404. A database that is
+					// down must not look like a workspace that never existed
+					// — that is how an outage gets diagnosed as a DNS
+					// problem for two hours.
+					slog.ErrorContext(ctx, "tenancy: could not resolve a workspace",
+						"error", err, "host", r.Host)
+					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+					return
+				}
+			}
+
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
@@ -169,7 +206,16 @@ func (p *Provider) Scoped(c app.Context) error {
 		}
 	}
 
-	binding, err := tenancy.Authorize(c.RequestContext(), p.Registry, identification, principal)
+	// Confirm when Resolve already selected, Authorize when it could not.
+	// Two lookups of the same workspace per request would be wasteful and,
+	// worse, could disagree with each other if the row changed in between.
+	var binding tenancy.Binding
+	var err error
+	if selected, ok := Selected(c.RequestContext()); ok {
+		binding, err = tenancy.Confirm(c.RequestContext(), p.Registry, selected, identification, principal)
+	} else {
+		binding, err = tenancy.Authorize(c.RequestContext(), p.Registry, identification, principal)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, tenancy.ErrNoWorkspace):
@@ -241,6 +287,16 @@ func AssertSurface(want ...hostname.Surface) app.Handler {
 func Identified(ctx context.Context) (tenancy.Identification, bool) {
 	identification, ok := ctx.Value(keyIdentification).(tenancy.Identification)
 	return identification, ok
+}
+
+// Selected returns the workspace the host resolved to, set by Resolve.
+//
+// It is NOT an authorisation. It says which workspace the request is about,
+// which is what a user lookup needs in order to find anybody at all —
+// Current is the one that means the caller may have it.
+func Selected(ctx context.Context) (tenancy.Workspace, bool) {
+	workspace, ok := ctx.Value(keySelected).(tenancy.Workspace)
+	return workspace, ok
 }
 
 // SurfaceOf returns the surface the request arrived on.

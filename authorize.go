@@ -119,21 +119,33 @@ type Binding struct {
 // workspace is still resolved then — an anonymous visitor must be able to
 // reach acme's sign-in page — but a HEADER-named workspace is refused,
 // because a header with nobody behind it is just a string from the internet.
-func Authorize(ctx context.Context, reg Registry, ident Identification, principal Principal) (Binding, error) {
+// Select resolves an identifier to a workspace WITHOUT authorising it.
+//
+// This is the half that can run before authentication, and splitting it out
+// is not a tidying: a request's workspace has to be known before the
+// application can look up the user, because the users table is scoped to a
+// workspace and a lookup with none finds nobody. Authorize cannot be moved
+// earlier to fix that — it needs a principal, which is what the lookup is
+// for — so the resolution happens first and the authorisation still happens
+// after, with nothing bound in between.
+//
+// Selecting is not granting. Nothing may be read or written on the strength
+// of a Select: it answers "which workspace is this request about", and
+// Confirm answers "may this caller have it".
+func Select(ctx context.Context, reg Registry, ident Identification) (Workspace, error) {
 	if ident.Workspace.IsZero() {
-		return Binding{}, ErrNoWorkspace
+		return Workspace{}, ErrNoWorkspace
 	}
+	return reg.Lookup(ctx, ident.Workspace)
+}
 
+// Confirm authorises an already-selected workspace for a principal.
+func Confirm(ctx context.Context, reg Registry, workspace Workspace, ident Identification, principal Principal) (Binding, error) {
 	if ident.Workspace.Source == SourceHeader && principal == nil {
 		return Binding{}, ErrNoPrincipal
 	}
 
-	workspace, err := reg.Lookup(ctx, ident.Workspace)
-	if err != nil {
-		return Binding{}, err
-	}
-
-	// A uuid header on a workspace host could not be compared without this
+	// A uuid header on a workspace host could not be compared without the
 	// lookup, so the comparison happens here. Disagreement is refused rather
 	// than resolved in the host's favour: the client has contradicted itself
 	// and the safe reading of a contradiction is neither branch.
@@ -167,4 +179,24 @@ func Authorize(ctx context.Context, reg Registry, ident Identification, principa
 	}
 
 	return Binding{Workspace: workspace, Source: ident.Workspace.Source}, nil
+}
+
+// Authorize resolves an identifier and authorises it in one step.
+//
+// Select followed by Confirm. Callers that have already selected — because
+// they had to, in order to find the user — call Confirm directly rather than
+// paying for a second lookup.
+func Authorize(ctx context.Context, reg Registry, ident Identification, principal Principal) (Binding, error) {
+	if ident.Workspace.IsZero() {
+		return Binding{}, ErrNoWorkspace
+	}
+	if ident.Workspace.Source == SourceHeader && principal == nil {
+		return Binding{}, ErrNoPrincipal
+	}
+
+	workspace, err := Select(ctx, reg, ident)
+	if err != nil {
+		return Binding{}, err
+	}
+	return Confirm(ctx, reg, workspace, ident, principal)
 }

@@ -1,8 +1,11 @@
 package provider
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/lemmego/fieldbubble/tenancy"
@@ -12,12 +15,42 @@ import (
 // The HTTPMiddleware half, which is testable as ordinary HTTP because that is
 // all it is.
 
+// fakeRegistry knows two workspaces and nothing else.
+//
+// Lookup is what Resolve calls; IsMember belongs to Scoped and is not
+// reached by any test in this file, which is the point of the split.
+type fakeRegistry struct {
+	workspaces map[string]tenancy.Workspace
+	err        error // when set, every lookup fails this way
+}
+
+func (r fakeRegistry) Lookup(_ context.Context, id tenancy.Identifier) (tenancy.Workspace, error) {
+	if r.err != nil {
+		return tenancy.Workspace{}, r.err
+	}
+	workspace, ok := r.workspaces[strings.ToLower(id.Value)]
+	if !ok {
+		return tenancy.Workspace{}, tenancy.ErrNoWorkspace
+	}
+	return workspace, nil
+}
+
+func (r fakeRegistry) IsMember(context.Context, string, tenancy.Principal) (bool, error) {
+	return false, errors.New("IsMember must not be reached from the HTTP middleware")
+}
+
 func testProvider() *Provider {
 	return &Provider{
 		Hostnames: hostname.Config{
 			AppDomain: "fieldbubble.localhost",
 			Reserved:  hostname.DefaultReserved(),
 		},
+		Registry: fakeRegistry{workspaces: map[string]tenancy.Workspace{
+			"acme": {ID: "11111111-1111-1111-1111-111111111111", Slug: "acme",
+				Name: "Acme", Status: tenancy.StatusActive},
+			"globex": {ID: "22222222-2222-2222-2222-222222222222", Slug: "globex",
+				Name: "Globex", Status: tenancy.StatusActive},
+		}},
 		SkipPrefixes: []string{"/build/", "/health"},
 	}
 }
@@ -61,6 +94,27 @@ func TestResolveRecordsTheWorkspaceForATenantHost(t *testing.T) {
 	}
 	if identification.Workspace.Value != "acme" || identification.Workspace.Source != tenancy.SourceHost {
 		t.Fatalf("workspace = %+v", identification.Workspace)
+	}
+}
+
+// Resolve also SELECTS the workspace for a host, which is what makes a user
+// lookup possible before authentication.
+func TestResolveSelectsTheWorkspaceForAHost(t *testing.T) {
+	var selected tenancy.Workspace
+	var ok bool
+
+	handler := testProvider().resolve()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		selected, ok = Selected(r.Context())
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Host = "acme.fieldbubble.localhost"
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+
+	if !ok {
+		t.Fatal("no workspace was selected, so a user lookup would find nobody")
+	}
+	if selected.ID != "11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("selected %+v", selected)
 	}
 }
 
@@ -137,6 +191,49 @@ func TestResolveRefusesAContradictoryRequestWithFourHundred(t *testing.T) {
 
 // Built assets must not pay for resolution, and must not 404 on a host that
 // does not resolve — the marketing site serves them from the apex.
+// A well-formed tenant host that names no workspace is a 404 — an unknown
+// subdomain, which is what it is.
+func TestResolveRefusesAHostThatNamesNoWorkspace(t *testing.T) {
+	recorder, _, _, ran := serve(t, testProvider(), "nosuchtenant.fieldbubble.localhost", "/", nil)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	if ran {
+		t.Fatal("the handler ran for a workspace that does not exist")
+	}
+}
+
+// And the distinction that matters more: a registry that is DOWN is a 503,
+// never a 404. A database outage that presents as "no such workspace" gets
+// diagnosed as a DNS problem for two hours.
+func TestAFailedLookupIsUnavailableAndNotMissing(t *testing.T) {
+	p := testProvider()
+	p.Registry = fakeRegistry{err: errors.New("connection refused")}
+
+	recorder, _, _, ran := serve(t, p, "acme.fieldbubble.localhost", "/", nil)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: an outage must not look like a missing tenant", recorder.Code)
+	}
+	if ran {
+		t.Fatal("the handler ran with no workspace resolved")
+	}
+}
+
+// A header-named workspace is deliberately NOT resolved here, so the 404 and
+// the non-member answer stay indistinguishable in Scoped.
+func TestResolveLeavesAHeaderNamedWorkspaceUnresolved(t *testing.T) {
+	p := testProvider()
+	p.Registry = fakeRegistry{err: errors.New("this must not be called")}
+
+	recorder, _, identified, ran := serve(t, p, "app.fieldbubble.localhost", "/account",
+		map[string]string{tenancy.HeaderSlug: "acme"})
+
+	if recorder.Code != http.StatusOK || !ran || !identified {
+		t.Fatalf("a header-named workspace must pass through unresolved: status %d, ran %v, identified %v",
+			recorder.Code, ran, identified)
+	}
+}
+
 func TestResolveSkipsTheConfiguredPrefixes(t *testing.T) {
 	recorder, _, identified, ran := serve(t, testProvider(), "anything.example.com", "/build/app-abc123.js", nil)
 

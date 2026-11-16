@@ -168,7 +168,21 @@ func force(tx *sql.Tx, table string, on bool) error {
 func SetLocal(ctx context.Context, exec interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }, workspaceID string) error {
-	_, err := exec.ExecContext(ctx, "SELECT set_config($1, $2, true)", GUC, workspaceID)
+	return SetLocalFunc(ctx, exec.ExecContext, workspaceID)
+}
+
+// SetLocalFunc is SetLocal for a handle whose method is spelled differently.
+//
+// It exists for orm.Tx, which offers Exec rather than ExecContext and so
+// satisfies no interface this package could declare. The alternative was for
+// the caller to write the set_config statement itself, which would mean two
+// places in the codebase generating it — and the whole value of there being
+// one is that `rg set_config` finds every writer, and that none of them can
+// quietly pass false for the third argument.
+func SetLocalFunc(ctx context.Context,
+	exec func(context.Context, string, ...any) (sql.Result, error),
+	workspaceID string) error {
+	_, err := exec(ctx, "SELECT set_config($1, $2, true)", GUC, workspaceID)
 	return err
 }
 
