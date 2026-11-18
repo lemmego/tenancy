@@ -268,6 +268,41 @@ func SelfTest(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// Unscoped names the tables that carry a workspace_id and deliberately have
+// no policy, with the reason for each.
+//
+// # Why an exemption list exists at all
+//
+// The conformance check below exists because the realistic failure is a
+// table gaining a workspace_id, no policy, and nobody noticing. An exemption
+// therefore has to be a deliberate, reviewed, written-down act rather than a
+// silent omission — which is what this map is: `rg Unscoped` finds every one
+// of them, and adding an entry is a diff somebody has to justify.
+//
+// # Why these two qualify
+//
+// Both are the REGISTRY: they are read in order to decide which workspace a
+// request is about, and by whom, before any workspace is bound. A policy on
+// them would be circular — the statement that establishes the scope cannot
+// itself require a scope — and the circularity does not fail loudly, it
+// answers "no such workspace" to everybody, forever.
+//
+// The test to apply before adding a third entry is not "does scoping it
+// break something". It is: is this table read BEFORE a workspace is known,
+// by a caller who could not possibly have named one yet? A table read after
+// resolution has no business here, however convenient the exemption would
+// be — and the convenient exemption is exactly how a tenant table ends up
+// unprotected.
+func Unscoped() map[string]string {
+	return map[string]string{
+		"workspaces": "the tenant table itself: a row in it cannot be scoped " +
+			"to the workspace it defines",
+		"workspace_owners": "the console reads every workspace one superuser " +
+			"owns, which is a question about no single workspace and so cannot " +
+			"be asked from inside one",
+	}
+}
+
 // Conformance reports tenant-scoped tables whose protection is not what this
 // package installs.
 //
@@ -297,12 +332,20 @@ func Conformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
 	}
 	defer rows.Close()
 
+	unscoped := Unscoped()
+
 	var findings []Finding
 	for rows.Next() {
 		var f Finding
 		var qual, withCheck string
 		if err := rows.Scan(&f.Table, &f.Enabled, &f.Forced, &f.Policies, &qual, &withCheck); err != nil {
 			return nil, err
+		}
+		if _, declared := unscoped[f.Table]; declared {
+			// Declared registry tables are skipped rather than silently
+			// passed over: the exemption is a line of Go with a reason
+			// attached, which is what keeps it reviewable.
+			continue
 		}
 		switch {
 		case !f.Enabled:
@@ -319,6 +362,48 @@ func Conformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
 		}
 	}
 	return findings, rows.Err()
+}
+
+// UnscopedConformance reports a declared registry table that has acquired a
+// policy after all.
+//
+// The inverse mistake, and worth catching because its symptom is baffling:
+// an exempt table with a policy answers nothing to everybody — the console
+// would list no workspaces and resolution would 404 every host — while the
+// table looks correctly protected to anybody auditing it.
+func UnscopedConformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
+	var findings []Finding
+	for table, reason := range Unscoped() {
+		var enabled bool
+		var policies int
+		err := db.QueryRowContext(ctx, `
+			SELECT c.relrowsecurity,
+			       coalesce((SELECT count(*) FROM pg_policies p
+			                  WHERE p.schemaname = n.nspname AND p.tablename = c.relname), 0)
+			  FROM pg_class c
+			  JOIN pg_namespace n ON n.oid = c.relnamespace
+			 WHERE c.relkind = 'r' AND n.nspname = 'public' AND c.relname = $1`, table).
+			Scan(&enabled, &policies)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Not a finding. A module whose migrations have not run yet, or
+			// a build that does not include this table, is not a failure of
+			// isolation.
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("rls: checking the registry table %s: %w", table, err)
+		}
+		if enabled || policies > 0 {
+			findings = append(findings, Finding{
+				Table:    table,
+				Enabled:  enabled,
+				Policies: policies,
+				Problem: "is declared unscoped (" + reason + ") but has row-level " +
+					"security, so it answers nothing to everybody",
+			})
+		}
+	}
+	return findings, nil
 }
 
 // Finding is one table whose protection is wrong.

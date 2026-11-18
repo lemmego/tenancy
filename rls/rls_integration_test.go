@@ -259,3 +259,54 @@ func TestConformanceCatchesAnUnprotectedTable(t *testing.T) {
 		t.Fatal("FindingsError should report a non-empty finding set")
 	}
 }
+
+// The gate. Not "the checker can spot a broken table" — the schema this
+// application actually has is protected, every table of it.
+//
+// This is the test that fails the day somebody adds a table with a
+// workspace_id and forgets the policy, which is the failure the whole design
+// is most exposed to: nothing else about that table looks wrong, the page
+// works, and the data is visible to every tenant.
+func TestTheSchemaInFrontOfUsIsConformant(t *testing.T) {
+	owner := open(t, "FIELDBUBBLE_OWNER_DSN")
+	ctx := context.Background()
+
+	findings, err := rls.Conformance(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rls.FindingsError(findings); err != nil {
+		t.Fatalf("the live schema is not conformant:\n%v", err)
+	}
+}
+
+// And the inverse: a table declared unscoped must not have quietly acquired
+// a policy, because an exempt table with a policy answers nothing to
+// everybody — the console would list no workspaces and every host would
+// 404 — while looking correctly protected to anyone auditing it.
+func TestTheRegistryTablesAreStillUnscoped(t *testing.T) {
+	owner := open(t, "FIELDBUBBLE_OWNER_DSN")
+	ctx := context.Background()
+
+	findings, err := rls.UnscopedConformance(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rls.FindingsError(findings); err != nil {
+		t.Fatalf("a declared registry table is scoped after all:\n%v", err)
+	}
+}
+
+// Every exemption carries a reason, and the reason is what makes the list
+// reviewable rather than a place to hide a table.
+func TestEveryExemptionIsExplained(t *testing.T) {
+	unscoped := rls.Unscoped()
+	if len(unscoped) == 0 {
+		t.Fatal("no registry tables are declared, so workspaces itself would be reported")
+	}
+	for table, reason := range unscoped {
+		if len(reason) < 40 {
+			t.Errorf("%s is exempt with only %q, which is not a reason", table, reason)
+		}
+	}
+}

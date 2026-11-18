@@ -209,3 +209,77 @@ func DefaultReserved() map[string]struct{} {
 	}
 	return reserved
 }
+
+// ErrBadLabel means the label is not a usable subdomain label.
+//
+// Separate from ErrMalformed, which is about a whole host: this is the rule
+// about what may be REGISTERED, and the caller wants to show it to somebody
+// filling in a form.
+var ErrBadLabel = errors.New("hostname: unusable workspace label")
+
+// ValidateLabel reports whether a label may be registered as a workspace,
+// and returns it in its canonical form.
+//
+// # Why this resolves rather than compares
+//
+// The second half of the check is not a list of forbidden names: it builds
+// the host the label would answer on and asks Resolve what that host means.
+// A label is registrable exactly when a host made from it resolves to a
+// workspace with that slug.
+//
+// That makes creation and resolution the same code, which is the only way
+// the two cannot drift. A hand-written copy of the rules would have to
+// remember the reserved list, both surface labels, the label-depth rule and
+// the normalisation — and the configured surface labels are the ones it
+// would miss: set CONSOLE_LABEL=portal and "portal" must become
+// unregistrable, because Resolve matches the surface labels before anything
+// else and a workspace called portal would be a workspace nobody can reach.
+//
+// Resolve deliberately does NOT enforce the slug pattern — a host that looks
+// like a slug but names no workspace is a 404 from the registry, not a
+// malformed request — so the shape rule is applied here, where it belongs.
+// It is the same rule as the CHECK constraint on the workspaces table, and
+// the application has a test that the two agree.
+func ValidateLabel(raw string, cfg Config) (string, error) {
+	label := strings.ToLower(strings.TrimSpace(raw))
+	if !labelShape(label) {
+		return "", fmt.Errorf(
+			"%w: %q — 3 to 32 characters, lowercase letters, digits and hyphens, "+
+				"starting and ending with a letter or a digit", ErrBadLabel, raw)
+	}
+
+	result, err := Resolve(label+"."+cfg.AppDomain, cfg)
+	if err != nil {
+		return "", err
+	}
+	if result.Surface != SurfaceWorkspace || result.Slug != label {
+		// Reachable when the label is a configured surface label, which
+		// Resolve answers before it ever considers a workspace.
+		return "", fmt.Errorf("%w: %q is the %s surface", ErrReserved, label, result.Surface)
+	}
+	return label, nil
+}
+
+// labelShape is the registrable-slug rule, and it is deliberately the same
+// expression as the workspaces_slug_shape CHECK constraint:
+//
+//	^[a-z0-9]([a-z0-9-]{1,30})[a-z0-9]$
+//
+// Written as a loop rather than a regexp so this file keeps no dependency
+// a hostname rule has no business having, and because the loop is what the
+// error message above describes.
+func labelShape(label string) bool {
+	if len(label) < 3 || len(label) > 32 {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		c := label[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-' && i > 0 && i < len(label)-1:
+		default:
+			return false
+		}
+	}
+	return true
+}

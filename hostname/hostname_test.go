@@ -138,3 +138,90 @@ func TestTheSurfaceLabelsAreConfigurable(t *testing.T) {
 		}
 	}
 }
+
+// A label is registrable exactly when a host made from it resolves back to a
+// workspace with that slug — which is why ValidateLabel calls Resolve
+// instead of keeping its own copy of the rules.
+func TestValidateLabel(t *testing.T) {
+	cfg := Config{AppDomain: "fieldbubble.localhost", Reserved: DefaultReserved()}
+
+	for _, tc := range []struct {
+		raw  string
+		want string
+		err  error
+	}{
+		{raw: "acme", want: "acme"},
+		{raw: "globex-inc", want: "globex-inc"},
+		{raw: "a1b", want: "a1b"},
+		{raw: "abc", want: "abc"},
+		{raw: "a12345678901234567890123456789012", err: ErrBadLabel}, // 33
+		{raw: "a1234567890123456789012345678901", want: "a1234567890123456789012345678901"},
+
+		// Canonicalised rather than refused: somebody typing "ACME " into a
+		// form has not made a mistake worth a message.
+		{raw: "ACME", want: "acme"},
+		{raw: "  acme  ", want: "acme"},
+
+		// Shape.
+		{raw: "", err: ErrBadLabel},
+		{raw: "ab", err: ErrBadLabel},
+		{raw: "-acme", err: ErrBadLabel},
+		{raw: "acme-", err: ErrBadLabel},
+		{raw: "ac_me", err: ErrBadLabel},
+		{raw: "ac.me", err: ErrBadLabel},
+		{raw: "ac me", err: ErrBadLabel},
+		{raw: "acmé", err: ErrBadLabel},
+
+		// Reserved, from the list.
+		{raw: "www", err: ErrReserved},
+		{raw: "admin", err: ErrReserved},
+		{raw: "api", err: ErrReserved},
+
+		// Reserved because they are surfaces. These are in the default list
+		// too, which is why the next test moves them.
+		{raw: "sys", err: ErrReserved},
+		{raw: "app", err: ErrReserved},
+	} {
+		got, err := ValidateLabel(tc.raw, cfg)
+		if tc.err != nil {
+			if !errors.Is(err, tc.err) {
+				t.Errorf("ValidateLabel(%q) = %q, %v; want %v", tc.raw, got, err, tc.err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ValidateLabel(%q): %v", tc.raw, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("ValidateLabel(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+// The case a hand-written copy of the rules would miss: a configured surface
+// label is not in the reserved list, and a workspace registered under it
+// would be a workspace nobody can reach, because Resolve answers the surface
+// first.
+func TestAConfiguredSurfaceLabelIsNotRegistrable(t *testing.T) {
+	cfg := Config{
+		AppDomain:     "fieldbubble.com",
+		PlatformLabel: "ops",
+		ConsoleLabel:  "portal",
+		// Deliberately empty: nothing but the surface labels themselves can
+		// make these unregistrable, which is the point.
+		Reserved: map[string]struct{}{},
+	}
+
+	for _, label := range []string{"ops", "portal"} {
+		if got, err := ValidateLabel(label, cfg); !errors.Is(err, ErrReserved) {
+			t.Errorf("ValidateLabel(%q) = %q, %v; want ErrReserved", label, got, err)
+		}
+	}
+	// And with the labels moved, the defaults are ordinary labels again.
+	for _, label := range []string{"sys", "app"} {
+		if got, err := ValidateLabel(label, cfg); err != nil || got != label {
+			t.Errorf("ValidateLabel(%q) = %q, %v; want it registrable", label, got, err)
+		}
+	}
+}
