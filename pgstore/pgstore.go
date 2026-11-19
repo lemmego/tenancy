@@ -45,11 +45,11 @@ func (s *Store) Lookup(ctx context.Context, id tenancy.Identifier) (tenancy.Work
 	)
 	switch id.Kind {
 	case tenancy.KindSlug:
-		query = `SELECT id, slug, name, status FROM workspaces
+		query = `SELECT id, slug, name, status, vertical FROM workspaces
 		          WHERE lower(slug) = lower($1) AND deleted_at IS NULL`
 		arg = id.Value
 	case tenancy.KindID:
-		query = `SELECT id, slug, name, status FROM workspaces
+		query = `SELECT id, slug, name, status, vertical FROM workspaces
 		          WHERE id = $1::uuid AND deleted_at IS NULL`
 		arg = id.Value
 	default:
@@ -58,8 +58,9 @@ func (s *Store) Lookup(ctx context.Context, id tenancy.Identifier) (tenancy.Work
 
 	var workspace tenancy.Workspace
 	var status string
+	var vertical sql.NullString
 	err := s.db.QueryRowContext(ctx, query, arg).
-		Scan(&workspace.ID, &workspace.Slug, &workspace.Name, &status)
+		Scan(&workspace.ID, &workspace.Slug, &workspace.Name, &status, &vertical)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return tenancy.Workspace{}, tenancy.ErrNoWorkspace
@@ -71,6 +72,9 @@ func (s *Store) Lookup(ctx context.Context, id tenancy.Identifier) (tenancy.Work
 		return tenancy.Workspace{}, fmt.Errorf("pgstore: resolving workspace: %w", err)
 	}
 	workspace.Status = tenancy.Status(status)
+	if vertical.Valid {
+		workspace.Vertical = vertical.String
+	}
 	return workspace, nil
 }
 
