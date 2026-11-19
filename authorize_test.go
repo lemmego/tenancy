@@ -9,8 +9,8 @@ import (
 // A registry over two tenants. ada belongs to acme only.
 type fakeRegistry struct {
 	tenants []Tenant
-	members    map[string][]string // tenant id -> principal keys
-	lookups    int
+	members map[string][]string // tenant id -> principal keys
+	lookups int
 }
 
 func newFakeRegistry() *fakeRegistry {

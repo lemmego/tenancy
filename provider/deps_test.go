@@ -27,7 +27,7 @@ func TestTheRootPackageDoesNotReachTheFramework(t *testing.T) {
 		"github.com/lemmego/tenancy",
 		"github.com/lemmego/tenancy/hostname",
 		"github.com/lemmego/tenancy/rls",
-		"github.com/lemmego/tenancy/pgstore",
+		"github.com/lemmego/tenancy/sqlstore",
 	} {
 		out, err := exec.Command("go", "list", "-deps", pkg).Output()
 		if err != nil {

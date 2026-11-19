@@ -6,6 +6,7 @@ require (
 	github.com/lemmego/api v0.14.1
 	github.com/lemmego/orm v0.4.0
 	github.com/lib/pq v1.12.3
+	github.com/mattn/go-sqlite3 v1.14.28
 )
 
 require (

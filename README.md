@@ -1,22 +1,47 @@
 # tenancy
 
 Multi-tenancy for a Lemmego application: which tenant a request is about,
-whether the caller may have it, and a database that enforces the answer
-rather than trusting it.
+whether the caller may have it, and that tenant bound to every query.
 
 ```go
 import (
     "github.com/lemmego/tenancy"
     "github.com/lemmego/tenancy/provider"
-    "github.com/lemmego/tenancy/rls"
+    "github.com/lemmego/tenancy/sqlstore"
 )
 ```
 
-Two layers, and the point of the package is that they are independent. The
-ORM carries an implicit predicate on every statement it builds; PostgreSQL
-carries a row-level security policy on every statement it executes. A
-cross-tenant read has to get past both, and a test that removes either one
-and still passes is a test proving the other works.
+## The core, and the extension
+
+The **core** is two things, and it works on every database the ORM supports:
+
+1. **Resolution** — read which tenant a request is about, from the host or a
+   header, and authorise the caller against their membership of it.
+2. **Binding** — bind that tenant to the handle, so the ORM adds a predicate
+   to every statement it builds and refuses one built from an unbound handle.
+
+Row-level security is an **extension**. PostgreSQL has it; MySQL and SQLite
+do not, and that is not a misconfiguration to work around — it is a database
+without the feature. Where it exists it is worth having, because then a
+cross-tenant read has to get past two independent layers and a test that
+removes either one and still passes is a test proving the other works. Where
+it does not, you have the core, which is the part that makes a
+client-supplied tenant identifier safe in the first place.
+
+Nothing in this package refuses to run on a database without it. The one
+place that can is `Provider.RequireEnforcement`, which is **off by default**
+and exists for an application whose threat model wants both layers and for
+which silently getting one would be the failure.
+
+| | PostgreSQL | MySQL | SQLite |
+|---|---|---|---|
+| resolution, authorisation, binding | yes | yes | yes |
+| row-level security (`tenancy/rls`) | yes | — | — |
+
+`sqlstore` is configured for the vendor — a placeholder spelling, an optional
+id cast — and its membership check is scoped only when you give it something
+to scope with. There is no `mysqlstore`, deliberately: the store is the
+portable half, and the half that is not portable is not a store.
 
 ## How a request names a tenant
 
@@ -95,7 +120,7 @@ rules always misses is a configured surface label: set `ConsoleLabel: "portal"`
 and `portal` must become unregistrable, because `Resolve` answers the surface
 before it considers a tenant at all.
 
-## The database half
+## The extension: PostgreSQL row-level security
 
 `rls` emits and verifies PostgreSQL row-level security.
 
@@ -138,11 +163,11 @@ behind a pooler in transaction mode. A session-level `SET` would leak the
 tenant and would look perfect in development, under one connection and one
 user.
 
-On MySQL or SQLite there is no equivalent, so there is nothing for a policy to
-read. `provider.Provider` refuses to boot on such a database unless you set
-`AllowUnenforced`, because an application that wired this package asked for
-isolation the database enforces, and silently getting one layer where you
-believed you had two is the failure this package exists to prevent.
+On MySQL or SQLite there is no equivalent, so there is nothing for a policy
+to read — and nothing here objects. The core does not need it. If your
+application does, set `Provider.RequireEnforcement` and a database that
+cannot bind a tenant to a transaction is refused at boot rather than
+discovered at the first request.
 
 ### Two checks to run at boot, in every environment
 
@@ -216,16 +241,16 @@ type Registry interface {
 }
 ```
 
-`pgstore` implements it over PostgreSQL. `Lookup` is uniform enough to
+`sqlstore` implements it over any SQL database. `Lookup` is uniform enough to
 configure — a table with an id, a slug, a name and a status — but membership
 is yours: which table holds it, and what a membership means for each
 population of caller, is not something a library can know. So you supply the
-query and `pgstore` supplies the thing that is easy to get wrong:
+query and `sqlstore` supplies the thing that is easy to get wrong:
 
 ```go
-store := pgstore.New(db, pgstore.Config{
+store := sqlstore.New(db, sqlstore.Config{
     Table: "workspaces",
-    RLS:   security,
+    Scope: security.SetLocal,   // the extension; omit it and Members filters itself
     Members: func(ctx context.Context, tx *sql.Tx, tenantID string, p tenancy.Principal) (bool, error) {
         // tx is ALREADY scoped to tenantID, so this needs no tenant predicate
         // and cannot see another tenant's rows.

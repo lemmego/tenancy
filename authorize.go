@@ -50,11 +50,10 @@ func (s Status) Serves() bool {
 // and a cache holding something with methods and a connection is a cache that
 // one day deserialises into a surprise.
 type Tenant struct {
-	ID       string // uuid, and the authoritative identifier
-	Slug     string
-	Name     string
-	Status   Status
-	Vertical string
+	ID     string // uuid, and the authoritative identifier
+	Slug   string
+	Name   string
+	Status Status
 }
 
 // Principal is whoever is making the request, as the identity layer sees

@@ -1,4 +1,4 @@
-package pgstore_test
+package sqlstore_test
 
 import (
 	"context"
@@ -10,8 +10,8 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/lemmego/tenancy"
-	"github.com/lemmego/tenancy/pgstore"
 	"github.com/lemmego/tenancy/rls"
+	"github.com/lemmego/tenancy/sqlstore"
 )
 
 // This suite builds its own schema.
@@ -29,14 +29,18 @@ import (
 // Both unset skips. A suite that skips and a suite that passes share an exit
 // code, so the skip says what is unverified.
 const (
-	membersTable = "pgstore_members"
-	tenantsTable = "pgstore_tenants"
+	membersTable = "sqlstore_members"
+	tenantsTable = "sqlstore_tenants"
 )
 
-func config(members pgstore.MemberFunc) pgstore.Config {
-	return pgstore.Config{
+// security is the extension this suite also exercises: PostgreSQL scoping,
+// so the membership query below can omit a tenant predicate.
+var security = rls.Config{Setting: "sqlstore_test.tenant_id", Column: "tenant_id"}
+
+func config(members sqlstore.MemberFunc) sqlstore.Config {
+	return sqlstore.Config{
 		Table:   tenantsTable,
-		RLS:     rls.Config{Setting: "pgstore_test.tenant_id", Column: "tenant_id"},
+		Scope:   security.SetLocal,
 		Members: members,
 	}
 }
@@ -61,7 +65,7 @@ func (p principal) PrincipalKind() string { return p.kind }
 func (p principal) PrincipalKey() string  { return p.key }
 
 type fixture struct {
-	store            *pgstore.Store
+	store            *sqlstore.Store
 	owner            *sql.DB
 	acmeID, globexID string
 }
@@ -121,15 +125,15 @@ func setup(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := config(nil).RLS.Enable(tx, membersTable); err != nil {
+	if err := security.Enable(tx, membersTable); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
-	f := fixture{store: pgstore.New(app, config(membersOf)), owner: owner}
-	for slug, into := range map[string]*string{"pgs-acme": &f.acmeID, "pgs-globex": &f.globexID} {
+	f := fixture{store: sqlstore.New(app, config(membersOf)), owner: owner}
+	for slug, into := range map[string]*string{"sqs-acme": &f.acmeID, "sqs-globex": &f.globexID} {
 		if err := owner.QueryRowContext(ctx,
 			`INSERT INTO `+tenantsTable+` (slug, name, status) VALUES ($1, $2, 'active')
 			 RETURNING id`, slug, slug).Scan(into); err != nil {
@@ -162,11 +166,11 @@ func TestLookupBySlugAndByID(t *testing.T) {
 	f := setup(t)
 	ctx := context.Background()
 
-	bySlug, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "pgs-acme"})
+	bySlug, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "sqs-acme"})
 	if err != nil {
 		t.Fatalf("lookup by slug: %v", err)
 	}
-	if bySlug.ID != f.acmeID || bySlug.Slug != "pgs-acme" || bySlug.Status != tenancy.StatusActive {
+	if bySlug.ID != f.acmeID || bySlug.Slug != "sqs-acme" || bySlug.Status != tenancy.StatusActive {
 		t.Fatalf("lookup by slug gave %+v", bySlug)
 	}
 
@@ -180,7 +184,7 @@ func TestLookupBySlugAndByID(t *testing.T) {
 
 	// Case-insensitive, matching the partial unique index a tenant table
 	// should carry on lower(slug).
-	upper, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "PGS-ACME"})
+	upper, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "SQS-ACME"})
 	if err != nil || upper.ID != f.acmeID {
 		t.Errorf("an uppercase slug gave %+v, %v", upper, err)
 	}
@@ -210,7 +214,7 @@ func TestLookupIgnoresASoftDeletedTenant(t *testing.T) {
 		`UPDATE `+tenantsTable+` SET deleted_at = now() WHERE id = $1`, f.globexID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "pgs-globex"}); !errors.Is(err, tenancy.ErrNoTenant) {
+	if _, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "sqs-globex"}); !errors.Is(err, tenancy.ErrNoTenant) {
 		t.Fatalf("a soft-deleted tenant resolved: %v", err)
 	}
 }
@@ -274,10 +278,10 @@ func TestNoPrincipalIsNoMember(t *testing.T) {
 // as a permissions bug; the missing configuration should say so.
 func TestAStoreWithNoMembershipQuerySaysSo(t *testing.T) {
 	f := setup(t)
-	bare := pgstore.New(f.owner, config(nil))
+	bare := sqlstore.New(f.owner, config(nil))
 
 	_, err := bare.IsMember(context.Background(), f.acmeID, principal{kind: "user", key: "ada"})
-	if !errors.Is(err, pgstore.ErrNoMembershipQuery) {
+	if !errors.Is(err, sqlstore.ErrNoMembershipQuery) {
 		t.Fatalf("IsMember with no query gave %v, want ErrNoMembershipQuery", err)
 	}
 }

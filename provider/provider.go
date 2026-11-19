@@ -54,8 +54,12 @@ type Provider struct {
 	Config tenancy.Config
 
 	// RLS is the row-level security configuration — the setting a policy
-	// reads and the column every scoped table carries. It has to name the
-	// same setting the ORM handle was opened with.
+	// reads and the column every scoped table carries — for the SetLocal
+	// helper below and for an application that wants one place to keep it.
+	//
+	// Optional. Nothing on the request path reads it: binding the tenant to
+	// the query is the ORM's job and happens on every database. This is
+	// here for the extension.
 	RLS rls.Config
 
 	// Registry resolves identifiers and memberships.
@@ -74,12 +78,15 @@ type Provider struct {
 	// static file is neither.
 	SkipPrefixes []string
 
-	// AllowUnenforced accepts a database that cannot bind a tenant to a
-	// transaction, leaving the ORM's predicate as the only isolation.
+	// RequireEnforcement refuses to boot on a database that cannot bind a
+	// tenant to a transaction — which is to say, one where row-level
+	// security would have nothing to read.
 	//
-	// Named rather than inferred, so "this deployment has one layer instead
-	// of two" is a line somebody wrote and a reviewer can find.
-	AllowUnenforced bool
+	// Off by default, because the core of this package does not need it: an
+	// application can resolve and bind tenants on any database the ORM
+	// supports. Set it when your threat model wants two independent layers
+	// and getting one silently would be the failure.
+	RequireEnforcement bool
 }
 
 var _ app.Provider = (*Provider)(nil)
@@ -100,21 +107,26 @@ func (p *Provider) Provide(a app.App) error {
 	p.Config = p.Config.WithDefaults()
 	p.RLS = p.RLS.WithDefaults()
 
-	// Refuse a database that cannot be told which tenant a transaction is
-	// for.
+	// Enforcement is an extension, so it is asked for rather than assumed.
 	//
-	// Asked here rather than discovered at the first request, because the
-	// answer is a property of the configuration: an application that wired
-	// this provider asked for isolation the database enforces, and on MySQL
-	// or SQLite it would get the ORM's predicate alone — one layer where it
-	// believed it had two, with nothing to say so. AllowUnenforced is the
-	// deliberate, greppable way to accept that.
-	if _, ok := orm.TenantEnterStatement(p.DB.Dialect()); !ok && !p.AllowUnenforced {
-		return fmt.Errorf(
-			"tenancy: %s cannot bind a tenant to a transaction, so row-level security "+
-				"has no value to read and the ORM's predicate would be the only "+
-				"isolation. Set AllowUnenforced to accept that deliberately",
-			p.DB.Dialect().Name())
+	// The core of this package is resolution and binding: read which tenant
+	// a request is about, authorise it, and bind it to the query. That works
+	// on every database the ORM supports. Row-level security is an
+	// additional layer that PostgreSQL happens to offer; a database without
+	// it is not a misconfiguration, it is a database without it.
+	//
+	// An application that genuinely requires both layers says so, and then
+	// this refuses a database that cannot provide the second. That is the
+	// right polarity: the default boots everywhere, and the stricter
+	// promise is a line somebody wrote.
+	if p.RequireEnforcement {
+		if _, ok := orm.TenantEnterStatement(p.DB.Dialect()); !ok {
+			return fmt.Errorf(
+				"tenancy: RequireEnforcement is set and %s cannot bind a tenant to a "+
+					"transaction, so row-level security would have no value to read "+
+					"and the ORM's predicate would be the only isolation",
+				p.DB.Dialect().Name())
+		}
 	}
 	if p.SkipPrefixes == nil {
 		p.SkipPrefixes = []string{"/build/", "/static/", "/storage/", "/favicon.ico", "/health", "/livez", "/readyz"}
