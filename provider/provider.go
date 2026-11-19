@@ -7,11 +7,11 @@
 //     pattern, which it must, because Go's ServeMux matches hosts exactly and
 //     cannot express a wildcard subdomain — so a tenant host is not something
 //     the route table can describe. It reads the host and the headers and
-//     records which workspace the request is ABOUT.
+//     records which tenant the request is ABOUT.
 //
 //   - Scoped is an app.Handler on a route group. It runs after authentication,
 //     which it must, because deciding whether the caller may have that
-//     workspace needs to know who the caller is. It authorises, then opens the
+//     tenant needs to know who the caller is. It authorises, then opens the
 //     request's tenant transaction.
 //
 // Putting both in one middleware is the mistake worth naming: an
@@ -32,9 +32,9 @@ import (
 	"github.com/lemmego/api/app"
 	"github.com/lemmego/orm"
 
-	"github.com/lemmego/fieldbubble/tenancy"
-	"github.com/lemmego/fieldbubble/tenancy/hostname"
-	"github.com/lemmego/fieldbubble/tenancy/rls"
+	"github.com/lemmego/tenancy"
+	"github.com/lemmego/tenancy/hostname"
+	"github.com/lemmego/tenancy/rls"
 )
 
 type contextKey int
@@ -48,10 +48,15 @@ const (
 
 // Provider installs tenant resolution.
 type Provider struct {
-	// Hostnames is the deployment's domain configuration. The zero value is
-	// refused: resolving every host to the marketing surface because nobody
-	// configured a domain is not a sensible default.
-	Hostnames hostname.Config
+	// Config is the deployment's domain layout and header names. A zero
+	// Hostnames.AppDomain is refused: resolving every host to the marketing
+	// surface because nobody configured a domain is not a sensible default.
+	Config tenancy.Config
+
+	// RLS is the row-level security configuration — the setting a policy
+	// reads and the column every scoped table carries. It has to name the
+	// same setting the ORM handle was opened with.
+	RLS rls.Config
 
 	// Registry resolves identifiers and memberships.
 	Registry tenancy.Registry
@@ -64,16 +69,23 @@ type Provider struct {
 	// not learn what a session is.
 	Principal func(app.Context) (tenancy.Principal, bool)
 
-	// SkipPrefixes are paths that never need a workspace: built assets,
+	// SkipPrefixes are paths that never need a tenant: built assets,
 	// health checks. Resolution is cheap but not free, and a transaction per
 	// static file is neither.
 	SkipPrefixes []string
+
+	// AllowUnenforced accepts a database that cannot bind a tenant to a
+	// transaction, leaving the ORM's predicate as the only isolation.
+	//
+	// Named rather than inferred, so "this deployment has one layer instead
+	// of two" is a line somebody wrote and a reviewer can find.
+	AllowUnenforced bool
 }
 
 var _ app.Provider = (*Provider)(nil)
 
 func (p *Provider) Provide(a app.App) error {
-	if p.Hostnames.AppDomain == "" {
+	if p.Config.Hostnames.AppDomain == "" {
 		return errors.New("tenancy: no APP_DOMAIN configured; every host would resolve to the marketing surface")
 	}
 	if p.Registry == nil {
@@ -82,8 +94,27 @@ func (p *Provider) Provide(a app.App) error {
 	if p.DB == nil {
 		return errors.New("tenancy: no DB configured")
 	}
-	if p.Hostnames.Reserved == nil {
-		p.Hostnames.Reserved = hostname.DefaultReserved()
+	if p.Config.Hostnames.Reserved == nil {
+		p.Config.Hostnames.Reserved = hostname.DefaultReserved()
+	}
+	p.Config = p.Config.WithDefaults()
+	p.RLS = p.RLS.WithDefaults()
+
+	// Refuse a database that cannot be told which tenant a transaction is
+	// for.
+	//
+	// Asked here rather than discovered at the first request, because the
+	// answer is a property of the configuration: an application that wired
+	// this provider asked for isolation the database enforces, and on MySQL
+	// or SQLite it would get the ORM's predicate alone — one layer where it
+	// believed it had two, with nothing to say so. AllowUnenforced is the
+	// deliberate, greppable way to accept that.
+	if _, ok := orm.TenantEnterStatement(p.DB.Dialect()); !ok && !p.AllowUnenforced {
+		return fmt.Errorf(
+			"tenancy: %s cannot bind a tenant to a transaction, so row-level security "+
+				"has no value to read and the ORM's predicate would be the only "+
+				"isolation. Set AllowUnenforced to accept that deliberately",
+			p.DB.Dialect().Name())
 	}
 	if p.SkipPrefixes == nil {
 		p.SkipPrefixes = []string{"/build/", "/static/", "/storage/", "/favicon.ico", "/health", "/livez", "/readyz"}
@@ -97,7 +128,7 @@ func (p *Provider) Provide(a app.App) error {
 
 	// Refuse to serve with a session cookie that is not host-only.
 	//
-	// One cookie on .fieldbubble.com would be sent to every tenant
+	// One cookie on .example.com would be sent to every tenant
 	// subdomain, so acme's session would travel to globex and the
 	// per-subdomain isolation this whole design assumes would be gone — in
 	// one configuration value, silently, with every test still passing.
@@ -105,7 +136,7 @@ func (p *Provider) Provide(a app.App) error {
 		return fmt.Errorf(
 			"tenancy: session.domain is %q and must be empty: a cookie scoped to a "+
 				"parent domain is sent to every tenant subdomain, which ends session "+
-				"isolation between workspaces", domain)
+				"isolation between tenants", domain)
 	}
 	return nil
 }
@@ -121,7 +152,7 @@ func (p *Provider) resolve() app.HTTPMiddleware {
 				}
 			}
 
-			identification, err := tenancy.Identify(r, p.Hostnames)
+			identification, err := tenancy.Identify(r, p.Config)
 			if err != nil {
 				switch {
 				case errors.Is(err, hostname.ErrUnknownHost), errors.Is(err, hostname.ErrReserved),
@@ -132,9 +163,9 @@ func (p *Provider) resolve() app.HTTPMiddleware {
 					http.NotFound(w, r)
 				case errors.Is(err, tenancy.ErrAmbiguous), errors.Is(err, tenancy.ErrBadIdentifier):
 					// This one IS worth hearing about: a client that names
-					// two workspaces, or contradicts the host it reached, is
+					// two tenants, or contradicts the host it reached, is
 					// either broken or probing.
-					slog.WarnContext(r.Context(), "tenancy: refused a workspace identifier",
+					slog.WarnContext(r.Context(), "tenancy: refused a tenant identifier",
 						"error", err, "host", r.Host, "path", r.URL.Path)
 					http.Error(w, "bad request", http.StatusBadRequest)
 				default:
@@ -145,35 +176,35 @@ func (p *Provider) resolve() app.HTTPMiddleware {
 
 			ctx := context.WithValue(r.Context(), keyIdentification, identification)
 
-			// Resolve the host to a workspace here, before authentication.
+			// Resolve the host to a tenant here, before authentication.
 			//
-			// Not an optimisation. The users table is scoped to a workspace,
-			// so looking a user up with no workspace bound finds nobody —
+			// Not an optimisation. The users table is scoped to a tenant,
+			// so looking a user up with no tenant bound finds nobody —
 			// and authentication runs before Scoped, because Scoped needs
-			// the user it would produce. Selecting the workspace from the
+			// the user it would produce. Selecting the tenant from the
 			// host breaks that circle: the host is not a claim about
 			// identity, so resolving it needs no principal.
 			//
-			// Only for a host. A header-named workspace stays unresolved
-			// until Scoped, where a non-member and a nonexistent workspace
+			// Only for a host. A header-named tenant stays unresolved
+			// until Scoped, where a non-member and a nonexistent tenant
 			// answer identically — resolving it here would answer 404 for
 			// one and something else for the other, which is the
 			// enumeration oracle this design exists to avoid.
-			if identification.Workspace.Source == tenancy.SourceHost {
-				workspace, err := tenancy.Select(ctx, p.Registry, identification)
+			if identification.Tenant.Source == tenancy.SourceHost {
+				tenant, err := tenancy.Select(ctx, p.Registry, identification)
 				switch {
 				case err == nil:
-					ctx = context.WithValue(ctx, keySelected, workspace)
-				case errors.Is(err, tenancy.ErrNoWorkspace):
+					ctx = context.WithValue(ctx, keySelected, tenant)
+				case errors.Is(err, tenancy.ErrNoTenant):
 					// An unknown subdomain, which is what it genuinely is.
 					http.NotFound(w, r)
 					return
 				default:
 					// A registry failure is NOT a 404. A database that is
-					// down must not look like a workspace that never existed
+					// down must not look like a tenant that never existed
 					// — that is how an outage gets diagnosed as a DNS
 					// problem for two hours.
-					slog.ErrorContext(ctx, "tenancy: could not resolve a workspace",
+					slog.ErrorContext(ctx, "tenancy: could not resolve a tenant",
 						"error", err, "host", r.Host)
 					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 					return
@@ -185,12 +216,12 @@ func (p *Provider) resolve() app.HTTPMiddleware {
 	}
 }
 
-// Scoped authorises the workspace and opens the request's tenant transaction.
+// Scoped authorises the tenant and opens the request's tenant transaction.
 //
 // Put it on every route group that touches tenant data, after authentication.
 // Everything downstream — the rest of the chain, the handler, the renderer —
 // runs inside one transaction, which is what lets the database enforce the
-// same workspace the ORM does.
+// same tenant the ORM does.
 func (p *Provider) Scoped(c app.Context) error {
 	identification, ok := Identified(c.RequestContext())
 	if !ok {
@@ -207,7 +238,7 @@ func (p *Provider) Scoped(c app.Context) error {
 	}
 
 	// Confirm when Resolve already selected, Authorize when it could not.
-	// Two lookups of the same workspace per request would be wasteful and,
+	// Two lookups of the same tenant per request would be wasteful and,
 	// worse, could disagree with each other if the row changed in between.
 	var binding tenancy.Binding
 	var err error
@@ -218,8 +249,8 @@ func (p *Provider) Scoped(c app.Context) error {
 	}
 	if err != nil {
 		switch {
-		case errors.Is(err, tenancy.ErrNoWorkspace):
-			// The same answer for "no such workspace" and "not yours", so
+		case errors.Is(err, tenancy.ErrNoTenant):
+			// The same answer for "no such tenant" and "not yours", so
 			// the response cannot be used to enumerate which companies are
 			// customers.
 			return c.NotFound(err)
@@ -229,7 +260,7 @@ func (p *Provider) Scoped(c app.Context) error {
 			return c.BadRequest(err)
 		default:
 			// A registry failure is NOT a 404. A database that is down must
-			// not look like a workspace that does not exist.
+			// not look like a tenant that does not exist.
 			return c.InternalServerError(err)
 		}
 	}
@@ -238,7 +269,7 @@ func (p *Provider) Scoped(c app.Context) error {
 		c.Request().Method == http.MethodHead ||
 		c.Request().Method == http.MethodOptions
 
-	return p.DB.TenantTxOptions(c.RequestContext(), binding.Workspace.ID,
+	return p.DB.TenantTxOptions(c.RequestContext(), binding.Tenant.ID,
 		readOnlyOptions(readOnly), func(tx *orm.Tx) error {
 			// SetRequest rather than c.Set, deliberately. c.Set uses the raw
 			// string as the context key, and a string key in a context
@@ -268,7 +299,7 @@ func readOnlyOptions(readOnly bool) *sql.TxOptions {
 // AssertSurface refuses a request that reached a route belonging to another
 // surface.
 //
-// 404 rather than 403: sys.fieldbubble.com must not confirm that a console
+// 404 rather than 403: sys.example.com must not confirm that a console
 // route exists somewhere.
 func AssertSurface(want ...hostname.Surface) app.Handler {
 	return func(c app.Context) error {
@@ -289,14 +320,14 @@ func Identified(ctx context.Context) (tenancy.Identification, bool) {
 	return identification, ok
 }
 
-// Selected returns the workspace the host resolved to, set by Resolve.
+// Selected returns the tenant the host resolved to, set by Resolve.
 //
-// It is NOT an authorisation. It says which workspace the request is about,
+// It is NOT an authorisation. It says which tenant the request is about,
 // which is what a user lookup needs in order to find anybody at all —
 // Current is the one that means the caller may have it.
-func Selected(ctx context.Context) (tenancy.Workspace, bool) {
-	workspace, ok := ctx.Value(keySelected).(tenancy.Workspace)
-	return workspace, ok
+func Selected(ctx context.Context) (tenancy.Tenant, bool) {
+	tenant, ok := ctx.Value(keySelected).(tenancy.Tenant)
+	return tenant, ok
 }
 
 // SurfaceOf returns the surface the request arrived on.
@@ -305,10 +336,10 @@ func SurfaceOf(ctx context.Context) (hostname.Surface, bool) {
 	return identification.Surface, ok
 }
 
-// Current returns the authorised workspace, set only inside Scoped.
-func Current(ctx context.Context) (tenancy.Workspace, bool) {
+// Current returns the authorised tenant, set only inside Scoped.
+func Current(ctx context.Context) (tenancy.Tenant, bool) {
 	binding, ok := ctx.Value(keyBinding).(tenancy.Binding)
-	return binding.Workspace, ok
+	return binding.Tenant, ok
 }
 
 // Tx returns the request's tenant transaction, set only inside Scoped.
@@ -322,6 +353,11 @@ func Tx(ctx context.Context) (*orm.Tx, bool) {
 	return tx, ok
 }
 
-// SetLocal is re-exported so an application that opens its own tenant
-// transaction scopes the database the same way this package does.
-var SetLocal = rls.SetLocal
+// SetLocal scopes a handle the same way this provider does, for an
+// application that opens its own transaction — a fixture, a migration, or a
+// path that runs before the request's own transaction exists.
+func (p *Provider) SetLocal(ctx context.Context, exec interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, tenantID string) error {
+	return p.RLS.SetLocal(ctx, exec, tenantID)
+}

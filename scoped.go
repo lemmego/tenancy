@@ -1,6 +1,6 @@
 package tenancy
 
-// Scoped is embedded by every model whose rows belong to a workspace.
+// Scoped is embedded by every model whose rows belong to a tenant.
 //
 //	type Site struct {
 //	    tenancy.Scoped
@@ -14,7 +14,7 @@ package tenancy
 //   - it declares the column name, the tag and the type in ONE place, so
 //     there is nothing per-model to get subtly wrong;
 //   - the orm:"tenantKey" tag makes every statement the ORM builds for that
-//     model carry an implicit workspace predicate, and makes a query through
+//     model carry an implicit tenant predicate, and makes a query through
 //     an unbound handle an error rather than an unfiltered result set;
 //   - `rg tenancy.Scoped` lists every tenant-scoped model in the codebase,
 //     which is what lets a conformance test cross-check the models against
@@ -25,12 +25,12 @@ package tenancy
 // table is isolated.
 //
 // A model embedding this must never be written through a handle that is not
-// bound to a workspace. Nothing sets WorkspaceID by hand — the ORM fills it
+// bound to a tenant. Nothing sets TenantID by hand — the ORM fills it
 // from the binding on insert, and refuses a value naming a different
-// workspace.
+// tenant.
 type Scoped struct {
-	WorkspaceID string `db:"workspace_id" orm:"column:workspace_id;tenantKey"`
+	TenantID string `db:"tenant_id" orm:"column:tenant_id;tenantKey"`
 }
 
-// Workspace returns the workspace this row belongs to.
-func (s Scoped) Workspace() string { return s.WorkspaceID }
+// Tenant returns the tenant this row belongs to.
+func (s Scoped) Tenant() string { return s.TenantID }

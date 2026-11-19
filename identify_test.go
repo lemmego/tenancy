@@ -6,11 +6,13 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/lemmego/fieldbubble/tenancy/hostname"
+	"github.com/lemmego/tenancy/hostname"
 )
 
-func cfg() hostname.Config {
-	return hostname.Config{AppDomain: "fieldbubble.localhost", Reserved: hostname.DefaultReserved()}
+func cfg() Config {
+	return Config{Hostnames: hostname.Config{
+		AppDomain: "example.localhost", Reserved: hostname.DefaultReserved(),
+	}}
 }
 
 func request(host string, headers map[string]string) *http.Request {
@@ -22,115 +24,115 @@ func request(host string, headers map[string]string) *http.Request {
 	return r
 }
 
-func TestTheHostNamesTheWorkspace(t *testing.T) {
-	got, err := Identify(request("acme.fieldbubble.localhost:8083", nil), cfg())
+func TestTheHostNamesTheTenant(t *testing.T) {
+	got, err := Identify(request("acme.example.localhost:8083", nil), cfg())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Surface != hostname.SurfaceWorkspace {
+	if got.Surface != hostname.SurfaceTenant {
 		t.Fatalf("surface = %v", got.Surface)
 	}
-	if got.Workspace.Kind != KindSlug || got.Workspace.Value != "acme" {
-		t.Fatalf("workspace = %+v", got.Workspace)
+	if got.Tenant.Kind != KindSlug || got.Tenant.Value != "acme" {
+		t.Fatalf("tenant = %+v", got.Tenant)
 	}
-	if got.Workspace.Source != SourceHost {
-		t.Fatalf("source = %v, want host", got.Workspace.Source)
+	if got.Tenant.Source != SourceHost {
+		t.Fatalf("source = %v, want host", got.Tenant.Source)
 	}
 }
 
 // The client sets the header from the URL, so the normal case is a header
 // that simply restates the host.
 func TestAHeaderThatRestatesTheHostIsAccepted(t *testing.T) {
-	got, err := Identify(request("acme.fieldbubble.localhost", map[string]string{HeaderSlug: "acme"}), cfg())
+	got, err := Identify(request("acme.example.localhost", map[string]string{DefaultSlugHeader: "acme"}), cfg())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Workspace.Value != "acme" {
-		t.Fatalf("workspace = %+v", got.Workspace)
+	if got.Tenant.Value != "acme" {
+		t.Fatalf("tenant = %+v", got.Tenant)
 	}
 	// The host is recorded as the source even though a header agreed, because
 	// the host is what was actually trusted.
-	if got.Workspace.Source != SourceHost {
-		t.Fatalf("source = %v, want host", got.Workspace.Source)
+	if got.Tenant.Source != SourceHost {
+		t.Fatalf("source = %v, want host", got.Tenant.Source)
 	}
 }
 
 // The case this rule exists for: a page served from acme asks for globex
 // while acme's session cookie rides along automatically.
 func TestAHeaderMayNotOverrideTheHost(t *testing.T) {
-	_, err := Identify(request("acme.fieldbubble.localhost", map[string]string{HeaderSlug: "globex"}), cfg())
+	_, err := Identify(request("acme.example.localhost", map[string]string{DefaultSlugHeader: "globex"}), cfg())
 	if !errors.Is(err, ErrAmbiguous) {
 		t.Fatalf("want ErrAmbiguous, got %v", err)
 	}
 }
 
 func TestBothHeadersTogetherAreRefused(t *testing.T) {
-	_, err := Identify(request("app.fieldbubble.localhost", map[string]string{
-		HeaderSlug: "acme",
-		HeaderID:   "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+	_, err := Identify(request("app.example.localhost", map[string]string{
+		DefaultSlugHeader: "acme",
+		DefaultIDHeader:   "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 	}), cfg())
 	if !errors.Is(err, ErrAmbiguous) {
 		t.Fatalf("want ErrAmbiguous, got %v", err)
 	}
 }
 
-func TestAnIDHeaderOnAWorkspaceHostDefersToTheHost(t *testing.T) {
-	got, err := Identify(request("acme.fieldbubble.localhost", map[string]string{
-		HeaderID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+func TestAnIDHeaderOnATenantHostDefersToTheHost(t *testing.T) {
+	got, err := Identify(request("acme.example.localhost", map[string]string{
+		DefaultIDHeader: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 	}), cfg())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Workspace.Kind != KindSlug || got.Workspace.Value != "acme" {
-		t.Fatalf("the host must win: %+v", got.Workspace)
+	if got.Tenant.Kind != KindSlug || got.Tenant.Value != "acme" {
+		t.Fatalf("the host must win: %+v", got.Tenant)
 	}
 	// A uuid cannot be compared to a slug without a lookup, so the check is
 	// handed on rather than dropped.
-	if got.Workspace.MustAgreeWith != "6ba7b810-9dad-11d1-80b4-00c04fd430c8" {
-		t.Fatalf("the id was dropped instead of deferred: %+v", got.Workspace)
+	if got.Tenant.MustAgreeWith != "6ba7b810-9dad-11d1-80b4-00c04fd430c8" {
+		t.Fatalf("the id was dropped instead of deferred: %+v", got.Tenant)
 	}
 }
 
-func TestOffAWorkspaceHostTheHeaderIsTheOnlySource(t *testing.T) {
-	for _, host := range []string{"app.fieldbubble.localhost", "sys.fieldbubble.localhost"} {
-		got, err := Identify(request(host, map[string]string{HeaderSlug: "acme"}), cfg())
+func TestOffATenantHostTheHeaderIsTheOnlySource(t *testing.T) {
+	for _, host := range []string{"app.example.localhost", "sys.example.localhost"} {
+		got, err := Identify(request(host, map[string]string{DefaultSlugHeader: "acme"}), cfg())
 		if err != nil {
 			t.Fatalf("%s: %v", host, err)
 		}
-		if got.Workspace.Value != "acme" || got.Workspace.Source != SourceHeader {
-			t.Fatalf("%s: workspace = %+v", host, got.Workspace)
+		if got.Tenant.Value != "acme" || got.Tenant.Source != SourceHeader {
+			t.Fatalf("%s: tenant = %+v", host, got.Tenant)
 		}
 	}
 }
 
-func TestNoHeaderOffAWorkspaceHostNamesNoWorkspace(t *testing.T) {
-	got, err := Identify(request("app.fieldbubble.localhost", nil), cfg())
+func TestNoHeaderOffATenantHostNamesNoTenant(t *testing.T) {
+	got, err := Identify(request("app.example.localhost", nil), cfg())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Workspace.IsZero() {
-		t.Fatalf("want no workspace, got %+v", got.Workspace)
+	if !got.Tenant.IsZero() {
+		t.Fatalf("want no tenant, got %+v", got.Tenant)
 	}
 }
 
 // A malformed header is a 400 before it reaches the database or a cache key.
 func TestAMalformedHeaderIsRefused(t *testing.T) {
 	bad := map[string]map[string]string{
-		"slug too short":     {HeaderSlug: "ab"},
-		"slug too long":      {HeaderSlug: "abcdefghijklmnopqrstuvwxyz0123456789"},
-		"slug with a dot":    {HeaderSlug: "acme.globex"},
-		"slug with a slash":  {HeaderSlug: "acme/../globex"},
-		"slug with a colon":  {HeaderSlug: "acme:globex"},
-		"slug with a quote":  {HeaderSlug: "acme'--"},
-		"slug leading dash":  {HeaderSlug: "-acme"},
-		"slug trailing dash": {HeaderSlug: "acme-"},
-		"id not a uuid":      {HeaderID: "not-a-uuid"},
-		"id too short":       {HeaderID: "6ba7b810-9dad-11d1-80b4-00c04fd430c"},
-		"id with a quote":    {HeaderID: "6ba7b810-9dad-11d1-80b4-00c04fd430c'"},
+		"slug too short":     {DefaultSlugHeader: "ab"},
+		"slug too long":      {DefaultSlugHeader: "abcdefghijklmnopqrstuvwxyz0123456789"},
+		"slug with a dot":    {DefaultSlugHeader: "acme.globex"},
+		"slug with a slash":  {DefaultSlugHeader: "acme/../globex"},
+		"slug with a colon":  {DefaultSlugHeader: "acme:globex"},
+		"slug with a quote":  {DefaultSlugHeader: "acme'--"},
+		"slug leading dash":  {DefaultSlugHeader: "-acme"},
+		"slug trailing dash": {DefaultSlugHeader: "acme-"},
+		"id not a uuid":      {DefaultIDHeader: "not-a-uuid"},
+		"id too short":       {DefaultIDHeader: "6ba7b810-9dad-11d1-80b4-00c04fd430c"},
+		"id with a quote":    {DefaultIDHeader: "6ba7b810-9dad-11d1-80b4-00c04fd430c'"},
 	}
 	for name, headers := range bad {
 		t.Run(name, func(t *testing.T) {
-			_, err := Identify(request("app.fieldbubble.localhost", headers), cfg())
+			_, err := Identify(request("app.example.localhost", headers), cfg())
 			if !errors.Is(err, ErrBadIdentifier) && !errors.Is(err, ErrAmbiguous) {
 				t.Fatalf("want a refusal, got %v", err)
 			}
@@ -139,18 +141,18 @@ func TestAMalformedHeaderIsRefused(t *testing.T) {
 }
 
 func TestIdentifiersAreLowercased(t *testing.T) {
-	got, err := Identify(request("app.fieldbubble.localhost", map[string]string{HeaderSlug: "ACME"}), cfg())
+	got, err := Identify(request("app.example.localhost", map[string]string{DefaultSlugHeader: "ACME"}), cfg())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Workspace.Value != "acme" {
-		t.Fatalf("value = %q, want lowercased", got.Workspace.Value)
+	if got.Tenant.Value != "acme" {
+		t.Fatalf("value = %q, want lowercased", got.Tenant.Value)
 	}
 }
 
-// An unknown or reserved host never reaches workspace resolution at all.
+// An unknown or reserved host never reaches tenant resolution at all.
 func TestAnUnknownHostIsRefusedBeforeAnyHeaderIsRead(t *testing.T) {
-	_, err := Identify(request("evil.acme.fieldbubble.localhost", map[string]string{HeaderSlug: "acme"}), cfg())
+	_, err := Identify(request("evil.acme.example.localhost", map[string]string{DefaultSlugHeader: "acme"}), cfg())
 	if !errors.Is(err, hostname.ErrUnknownHost) {
 		t.Fatalf("want ErrUnknownHost, got %v", err)
 	}

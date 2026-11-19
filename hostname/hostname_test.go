@@ -21,20 +21,20 @@ func TestResolve(t *testing.T) {
 		{host: "sys.{domain}", surface: SurfacePlatform},
 		{host: "app.{domain}", surface: SurfaceConsole},
 
-		// A workspace.
-		{host: "acme.{domain}", surface: SurfaceWorkspace, slug: "acme"},
-		{host: "globex-inc.{domain}", surface: SurfaceWorkspace, slug: "globex-inc"},
-		{host: "a1.{domain}", surface: SurfaceWorkspace, slug: "a1"},
+		// A tenant.
+		{host: "acme.{domain}", surface: SurfaceTenant, slug: "acme"},
+		{host: "globex-inc.{domain}", surface: SurfaceTenant, slug: "globex-inc"},
+		{host: "a1.{domain}", surface: SurfaceTenant, slug: "a1"},
 
 		// Ports are stripped, so development changes nothing.
-		{host: "acme.{domain}:8083", surface: SurfaceWorkspace, slug: "acme"},
+		{host: "acme.{domain}:8083", surface: SurfaceTenant, slug: "acme"},
 		{host: "{domain}:8083", surface: SurfaceMarketing},
 		{host: "sys.{domain}:8083", surface: SurfacePlatform},
 
 		// Case and the legal trailing dot.
-		{host: "ACME.{domain}", surface: SurfaceWorkspace, slug: "acme"},
-		{host: "acme.{domain}.", surface: SurfaceWorkspace, slug: "acme"},
-		{host: "  acme.{domain}  ", surface: SurfaceWorkspace, slug: "acme"},
+		{host: "ACME.{domain}", surface: SurfaceTenant, slug: "acme"},
+		{host: "acme.{domain}.", surface: SurfaceTenant, slug: "acme"},
+		{host: "  acme.{domain}  ", surface: SurfaceTenant, slug: "acme"},
 
 		// The attack this function exists to refuse. A suffix test alone
 		// accepts these, and then the label is read as "evil.acme" — or
@@ -43,10 +43,13 @@ func TestResolve(t *testing.T) {
 		{host: "evil.acme.{domain}", err: ErrUnknownHost},
 		{host: "a.b.c.{domain}", err: ErrUnknownHost},
 
-		// Not our domain at all, including the lookalikes.
-		{host: "acme.example.com", err: ErrUnknownHost},
-		{host: "{domain}.evil.com", err: ErrUnknownHost},
-		{host: "notfieldbubble.com", err: ErrUnknownHost},
+		// Not our domain at all, including the lookalikes. Deliberately
+		// nothing under example.com, which is one of the app domains this
+		// table is run against — a "foreign" host that is also the
+		// application's own domain is a case that cannot be both.
+		{host: "acme.elsewhere.test", err: ErrUnknownHost},
+		{host: "{domain}.evil.test", err: ErrUnknownHost},
+		{host: "notthedomain.test", err: ErrUnknownHost},
 
 		// Reserved.
 		{host: "www.{domain}", err: ErrReserved},
@@ -61,7 +64,7 @@ func TestResolve(t *testing.T) {
 		{host: "user@acme.{domain}", err: ErrMalformed},
 	}
 
-	for _, domain := range []string{"fieldbubble.localhost", "fieldbubble.com", "fb.co.uk"} {
+	for _, domain := range []string{"example.localhost", "example.com", "fb.co.uk"} {
 		cfg := Config{AppDomain: domain, Reserved: DefaultReserved()}
 		for _, tc := range cases {
 			host := subst(tc.host, domain)
@@ -111,23 +114,23 @@ func indexOf(s, sub string) int {
 // A deployment that forgot to configure its domain must not resolve
 // everything to the marketing surface.
 func TestAnUnconfiguredDomainResolvesNothing(t *testing.T) {
-	if _, err := Resolve("acme.fieldbubble.com", Config{}); !errors.Is(err, ErrMalformed) {
+	if _, err := Resolve("acme.example.com", Config{}); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("want ErrMalformed, got %v", err)
 	}
 }
 
-// The labels are configurable, and a workspace may not take one.
+// The labels are configurable, and a tenant may not take one.
 func TestTheSurfaceLabelsAreConfigurable(t *testing.T) {
-	cfg := Config{AppDomain: "fieldbubble.com", PlatformLabel: "ops", ConsoleLabel: "portal"}
+	cfg := Config{AppDomain: "example.com", PlatformLabel: "ops", ConsoleLabel: "portal"}
 
 	for host, want := range map[string]Surface{
-		"ops.fieldbubble.com":    SurfacePlatform,
-		"portal.fieldbubble.com": SurfaceConsole,
+		"ops.example.com":    SurfacePlatform,
+		"portal.example.com": SurfaceConsole,
 		// With the labels moved, the defaults are ordinary labels again —
 		// which is why the reserved list, not this switch, is what stops a
-		// workspace calling itself "app".
-		"sys.fieldbubble.com": SurfaceWorkspace,
-		"app.fieldbubble.com": SurfaceWorkspace,
+		// tenant calling itself "app".
+		"sys.example.com": SurfaceTenant,
+		"app.example.com": SurfaceTenant,
 	} {
 		got, err := Resolve(host, cfg)
 		if err != nil {
@@ -140,10 +143,10 @@ func TestTheSurfaceLabelsAreConfigurable(t *testing.T) {
 }
 
 // A label is registrable exactly when a host made from it resolves back to a
-// workspace with that slug — which is why ValidateLabel calls Resolve
+// tenant with that slug — which is why ValidateLabel calls Resolve
 // instead of keeping its own copy of the rules.
 func TestValidateLabel(t *testing.T) {
-	cfg := Config{AppDomain: "fieldbubble.localhost", Reserved: DefaultReserved()}
+	cfg := Config{AppDomain: "example.localhost", Reserved: DefaultReserved()}
 
 	for _, tc := range []struct {
 		raw  string
@@ -200,12 +203,12 @@ func TestValidateLabel(t *testing.T) {
 }
 
 // The case a hand-written copy of the rules would miss: a configured surface
-// label is not in the reserved list, and a workspace registered under it
-// would be a workspace nobody can reach, because Resolve answers the surface
+// label is not in the reserved list, and a tenant registered under it
+// would be a tenant nobody can reach, because Resolve answers the surface
 // first.
 func TestAConfiguredSurfaceLabelIsNotRegistrable(t *testing.T) {
 	cfg := Config{
-		AppDomain:     "fieldbubble.com",
+		AppDomain:     "example.com",
 		PlatformLabel: "ops",
 		ConsoleLabel:  "portal",
 		// Deliberately empty: nothing but the surface labels themselves can

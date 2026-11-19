@@ -1,0 +1,107 @@
+# This workflow runs in THIS module's own repository, where the repository
+# root is the module root.
+#
+# That is why there are no `paths:` filters and no `cd` into a subdirectory.
+# The three workflows that used to exist in this monorepo were written as
+# though it were a single repository, filtering on paths like "api/**" and
+# "go.work" which do not exist in a per-module checkout. They therefore never
+# triggered — `gh run list` reported zero runs for queue and tasker ever, and
+# nothing but GitHub's own Dependency Graph for api — and every step would
+# have failed if they had, since `cd api`, `go build ./api/...` and
+# `go work sync` all name things that are not there.
+#
+# There is also no GOWORK=off step. That distinction matters in the monorepo
+# working tree, where a workspace can mask a missing requirement; here there
+# is no go.work at all, so the ordinary run already is the standalone one.
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TENANCY_SUPER_DSN: postgres://postgres:postgres@127.0.0.1:5432/tenancy_test?sslmode=disable
+  TENANCY_OWNER_DSN: postgres://tenancy_owner:owner@127.0.0.1:5432/tenancy_test?sslmode=disable
+  TENANCY_APP_DSN: postgres://tenancy_app:app@127.0.0.1:5432/tenancy_test?sslmode=disable
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tenancy_test
+        ports: ['5432:5432']
+        # Without a health check the first step can connect before Postgres
+        # accepts connections, which surfaces as a test failure rather than
+        # as the startup race it is.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      # Three roles, because the suite proves the difference between them: the
+      # application role is subject to every policy, the owner owns the tables
+      # and is STILL subject because FORCE says so, and the superuser bypasses
+      # them — which is what one of these tests exists to demonstrate.
+      #
+      # Running the whole suite as the superuser would make every isolation
+      # assertion pass while proving nothing, which is the failure this
+      # package's own AssertNotPrivileged exists to catch.
+      - name: Provision the three roles
+        run: |
+          psql "$TENANCY_SUPER_DSN" -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE ROLE tenancy_owner LOGIN PASSWORD 'owner' NOSUPERUSER NOBYPASSRLS;
+            CREATE ROLE tenancy_app   LOGIN PASSWORD 'app'   NOSUPERUSER NOBYPASSRLS;
+            GRANT CREATE, USAGE ON SCHEMA public TO tenancy_owner;
+            GRANT USAGE ON SCHEMA public TO tenancy_app;
+            ALTER DEFAULT PRIVILEGES FOR ROLE tenancy_owner IN SCHEMA public
+              GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO tenancy_app;
+            ALTER DEFAULT PRIVILEGES FOR ROLE tenancy_owner IN SCHEMA public
+              GRANT USAGE, SELECT ON SEQUENCES TO tenancy_app;
+            CREATE EXTENSION IF NOT EXISTS pgcrypto;
+          SQL
+
+      - name: go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 -v ./... 2>&1 | tee /tmp/test.log
+
+      # A suite that skips and a suite that passes share an exit code, so the
+      # only way to tell them apart is to look. The database half of this
+      # package's guarantee skips when the DSNs are unset — which is right for
+      # a laptop on a plane and wrong for CI, where an unset variable would
+      # quietly stop testing the half that matters.
+      - name: Nothing was skipped
+        run: |
+          if grep -q -- '--- SKIP' /tmp/test.log; then
+            echo "A test skipped in CI:"
+            grep -- '--- SKIP' /tmp/test.log
+            exit 1
+          fi

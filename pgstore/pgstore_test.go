@@ -9,16 +9,51 @@ import (
 
 	_ "github.com/lib/pq"
 
-	"github.com/lemmego/fieldbubble/tenancy"
-	"github.com/lemmego/fieldbubble/tenancy/pgstore"
+	"github.com/lemmego/tenancy"
+	"github.com/lemmego/tenancy/pgstore"
+	"github.com/lemmego/tenancy/rls"
 )
 
-// Against the real schema, because the thing being tested is whether a
-// membership check works through a row-level security policy — which cannot
-// be established without the policy.
+// This suite builds its own schema.
 //
-//	FIELDBUBBLE_OWNER_DSN  creates the fixture
-//	FIELDBUBBLE_APP_DSN    what the store uses, unprivileged like production
+// The version it replaces read an application's `tenants` and `users` tables,
+// which is what a package extracted from one application looks like before
+// anybody asks it to work in another. Creating the fixture here costs forty
+// lines and buys two things: the suite runs against any PostgreSQL, and the
+// membership query can deliberately omit a tenant predicate — so the test
+// proves this package scopes it rather than assuming so.
+//
+//	TENANCY_OWNER_DSN  a role that can create tables and owns them
+//	TENANCY_APP_DSN    the unprivileged role the store connects as
+//
+// Both unset skips. A suite that skips and a suite that passes share an exit
+// code, so the skip says what is unverified.
+const (
+	membersTable = "pgstore_members"
+	tenantsTable = "pgstore_tenants"
+)
+
+func config(members pgstore.MemberFunc) pgstore.Config {
+	return pgstore.Config{
+		Table:   tenantsTable,
+		RLS:     rls.Config{Setting: "pgstore_test.tenant_id", Column: "tenant_id"},
+		Members: members,
+	}
+}
+
+// membersOf answers from the fixture table, with NO tenant predicate.
+//
+// That omission is the assertion. The transaction this runs in has already
+// been scoped by pgstore, so the policy supplies the predicate; if it did not,
+// every caller would be a member of every tenant and the cross-tenant test
+// below would fail.
+func membersOf(ctx context.Context, tx *sql.Tx, _ string, principal tenancy.Principal) (bool, error) {
+	var exists bool
+	err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM `+membersTable+`
+		                 WHERE user_id = $1 AND active)`, principal.PrincipalKey()).Scan(&exists)
+	return exists, err
+}
 
 type principal struct{ kind, key string }
 
@@ -27,16 +62,15 @@ func (p principal) PrincipalKey() string  { return p.key }
 
 type fixture struct {
 	store            *pgstore.Store
+	owner            *sql.DB
 	acmeID, globexID string
-	adaInAcme        string
-	graceInGlobex    string
 }
 
 func setup(t *testing.T) fixture {
 	t.Helper()
-	ownerDSN, appDSN := os.Getenv("FIELDBUBBLE_OWNER_DSN"), os.Getenv("FIELDBUBBLE_APP_DSN")
+	ownerDSN, appDSN := os.Getenv("TENANCY_OWNER_DSN"), os.Getenv("TENANCY_APP_DSN")
 	if ownerDSN == "" || appDSN == "" {
-		t.Skip("FIELDBUBBLE_OWNER_DSN and FIELDBUBBLE_APP_DSN are unset, so the membership path is unverified")
+		t.Skip("TENANCY_OWNER_DSN and TENANCY_APP_DSN are unset, so the membership path is unverified")
 	}
 
 	owner, err := sql.Open("postgres", ownerDSN)
@@ -44,6 +78,9 @@ func setup(t *testing.T) fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { owner.Close() })
+	if err := owner.Ping(); err != nil {
+		t.Fatalf("TENANCY_OWNER_DSN: %v", err)
+	}
 
 	app, err := sql.Open("postgres", appDSN)
 	if err != nil {
@@ -52,51 +89,70 @@ func setup(t *testing.T) fixture {
 	t.Cleanup(func() { app.Close() })
 
 	ctx := context.Background()
-	f := fixture{store: pgstore.New(app)}
+	drop := func() {
+		_, _ = owner.Exec(`DROP TABLE IF EXISTS ` + membersTable)
+		_, _ = owner.Exec(`DROP TABLE IF EXISTS ` + tenantsTable)
+	}
+	drop()
+	t.Cleanup(drop)
 
-	// A clean slate for the slugs these tests use, then two workspaces with
-	// one member each. Seeded as the owner with FORCE lifted, which is the
-	// same escape hatch a data migration uses.
 	if _, err := owner.ExecContext(ctx, `
-		ALTER TABLE users NO FORCE ROW LEVEL SECURITY;
-		DELETE FROM users WHERE email LIKE '%@pgstore.test';
-		DELETE FROM workspaces WHERE slug IN ('pgs-acme','pgs-globex','pgs-gone');
-		ALTER TABLE users FORCE ROW LEVEL SECURITY;`); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_, _ = owner.Exec(`
-			ALTER TABLE users NO FORCE ROW LEVEL SECURITY;
-			DELETE FROM users WHERE email LIKE '%@pgstore.test';
-			DELETE FROM workspaces WHERE slug IN ('pgs-acme','pgs-globex','pgs-gone');
-			ALTER TABLE users FORCE ROW LEVEL SECURITY;`)
-	})
-
-	if err := owner.QueryRowContext(ctx,
-		`INSERT INTO workspaces (slug,name,status) VALUES ('pgs-acme','Acme','active') RETURNING id`).
-		Scan(&f.acmeID); err != nil {
-		t.Fatal(err)
-	}
-	if err := owner.QueryRowContext(ctx,
-		`INSERT INTO workspaces (slug,name,status) VALUES ('pgs-globex','Globex','active') RETURNING id`).
-		Scan(&f.globexID); err != nil {
+		CREATE EXTENSION IF NOT EXISTS pgcrypto;
+		CREATE TABLE `+tenantsTable+` (
+			id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+			slug       text NOT NULL,
+			name       text NOT NULL,
+			status     text NOT NULL,
+			deleted_at timestamptz
+		);
+		CREATE TABLE `+membersTable+` (
+			tenant_id uuid    NOT NULL,
+			user_id   text    NOT NULL,
+			active    boolean NOT NULL DEFAULT true,
+			PRIMARY KEY (tenant_id, user_id)
+		);
+		GRANT SELECT, INSERT, UPDATE, DELETE ON `+tenantsTable+`, `+membersTable+` TO PUBLIC;`); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := owner.ExecContext(ctx, `ALTER TABLE users NO FORCE ROW LEVEL SECURITY`); err != nil {
+	// The members table is protected; the tenant table is not, because
+	// resolving a tenant is what establishes the scope.
+	tx, err := owner.BeginTx(ctx, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := owner.QueryRowContext(ctx,
-		`INSERT INTO users (workspace_id,email,name,password) VALUES ($1,'ada@pgstore.test','Ada','x') RETURNING id`,
-		f.acmeID).Scan(&f.adaInAcme); err != nil {
+	if err := config(nil).RLS.Enable(tx, membersTable); err != nil {
 		t.Fatal(err)
 	}
-	if err := owner.QueryRowContext(ctx,
-		`INSERT INTO users (workspace_id,email,name,password) VALUES ($1,'grace@pgstore.test','Grace','x') RETURNING id`,
-		f.globexID).Scan(&f.graceInGlobex); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.ExecContext(ctx, `ALTER TABLE users FORCE ROW LEVEL SECURITY`); err != nil {
+
+	f := fixture{store: pgstore.New(app, config(membersOf)), owner: owner}
+	for slug, into := range map[string]*string{"pgs-acme": &f.acmeID, "pgs-globex": &f.globexID} {
+		if err := owner.QueryRowContext(ctx,
+			`INSERT INTO `+tenantsTable+` (slug, name, status) VALUES ($1, $2, 'active')
+			 RETURNING id`, slug, slug).Scan(into); err != nil {
+			t.Fatalf("seed %s: %v", slug, err)
+		}
+	}
+
+	// One member each, written as the owner with FORCE lifted — the same
+	// escape hatch a data migration uses.
+	if _, err := owner.ExecContext(ctx, `ALTER TABLE `+membersTable+` NO FORCE ROW LEVEL SECURITY`); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range [][2]string{{f.acmeID, "ada"}, {f.globexID, "grace"}, {f.globexID, "departed"}} {
+		if _, err := owner.ExecContext(ctx,
+			`INSERT INTO `+membersTable+` (tenant_id, user_id) VALUES ($1, $2)`, row[0], row[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := owner.ExecContext(ctx,
+		`UPDATE `+membersTable+` SET active = false WHERE user_id = 'departed'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.ExecContext(ctx, `ALTER TABLE `+membersTable+` FORCE ROW LEVEL SECURITY`); err != nil {
 		t.Fatal(err)
 	}
 	return f
@@ -108,24 +164,25 @@ func TestLookupBySlugAndByID(t *testing.T) {
 
 	bySlug, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "pgs-acme"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("lookup by slug: %v", err)
 	}
-	if bySlug.ID != f.acmeID || bySlug.Status != tenancy.StatusActive {
-		t.Fatalf("by slug = %+v", bySlug)
+	if bySlug.ID != f.acmeID || bySlug.Slug != "pgs-acme" || bySlug.Status != tenancy.StatusActive {
+		t.Fatalf("lookup by slug gave %+v", bySlug)
 	}
 
 	byID, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindID, Value: f.acmeID})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("lookup by id: %v", err)
 	}
-	if byID.Slug != "pgs-acme" {
-		t.Fatalf("by id = %+v", byID)
+	if byID != bySlug {
+		t.Errorf("by id gave %+v, by slug %+v", byID, bySlug)
 	}
 
-	// Case-insensitive, matching the index the migration creates.
+	// Case-insensitive, matching the partial unique index a tenant table
+	// should carry on lower(slug).
 	upper, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "PGS-ACME"})
 	if err != nil || upper.ID != f.acmeID {
-		t.Fatalf("uppercase lookup: %+v %v", upper, err)
+		t.Errorf("an uppercase slug gave %+v, %v", upper, err)
 	}
 }
 
@@ -134,134 +191,93 @@ func TestLookupOfSomethingAbsent(t *testing.T) {
 	ctx := context.Background()
 
 	for name, id := range map[string]tenancy.Identifier{
-		"unknown slug": {Kind: tenancy.KindSlug, Value: "pgs-gone"},
-		"unknown uuid": {Kind: tenancy.KindID, Value: "99999999-9999-9999-9999-999999999999"},
-		"no kind":      {},
+		"an unknown slug": {Kind: tenancy.KindSlug, Value: "nobody"},
+		"an unknown uuid": {Kind: tenancy.KindID, Value: "00000000-0000-4000-8000-000000000000"},
+		"no identifier":   {},
 	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := f.store.Lookup(ctx, id); !errors.Is(err, tenancy.ErrNoWorkspace) {
-				t.Fatalf("want ErrNoWorkspace, got %v", err)
-			}
-		})
-	}
-}
-
-// A soft-deleted workspace is gone, and its slug is free for somebody else.
-func TestLookupIgnoresASoftDeletedWorkspace(t *testing.T) {
-	f := setup(t)
-	ctx := context.Background()
-	owner, _ := sql.Open("postgres", os.Getenv("FIELDBUBBLE_OWNER_DSN"))
-	defer owner.Close()
-
-	if _, err := owner.ExecContext(ctx,
-		`UPDATE workspaces SET deleted_at = now() WHERE id = $1`, f.acmeID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "pgs-acme"}); !errors.Is(err, tenancy.ErrNoWorkspace) {
-		t.Fatalf("a soft-deleted workspace still resolves: %v", err)
-	}
-}
-
-// The check that makes a client-supplied header safe, against the real policy.
-func TestIsMemberOnlyWhereTheCallerHasARow(t *testing.T) {
-	f := setup(t)
-	ctx := context.Background()
-	ada := principal{kind: "user", key: f.adaInAcme}
-	grace := principal{kind: "user", key: f.graceInGlobex}
-
-	cases := []struct {
-		name      string
-		workspace string
-		who       tenancy.Principal
-		want      bool
-	}{
-		{"ada in her own workspace", f.acmeID, ada, true},
-		{"ada in somebody else's", f.globexID, ada, false},
-		{"grace in her own workspace", f.globexID, grace, true},
-		{"grace in somebody else's", f.acmeID, grace, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := f.store.IsMember(ctx, tc.workspace, tc.who)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tc.want {
-				t.Fatalf("IsMember = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-// Deactivating somebody revokes membership immediately, without touching a
-// cache — which is the property the design leans on for "remove this person
-// and get them out now".
-func TestADeactivatedUserIsNotAMember(t *testing.T) {
-	f := setup(t)
-	ctx := context.Background()
-	owner, _ := sql.Open("postgres", os.Getenv("FIELDBUBBLE_OWNER_DSN"))
-	defer owner.Close()
-
-	// Three separate statements, not one. A parameterised Exec goes over the
-	// extended protocol, where PostgreSQL refuses multiple commands in one
-	// prepared statement — the same constraint that makes a migration through
-	// a transaction pooler fail.
-	for _, statement := range []struct {
-		sql  string
-		args []any
-	}{
-		{sql: `ALTER TABLE users NO FORCE ROW LEVEL SECURITY`},
-		{sql: `UPDATE users SET active = false WHERE id = $1`, args: []any{f.adaInAcme}},
-		{sql: `ALTER TABLE users FORCE ROW LEVEL SECURITY`},
-	} {
-		if _, err := owner.ExecContext(ctx, statement.sql, statement.args...); err != nil {
-			t.Fatal(err)
+		if _, err := f.store.Lookup(ctx, id); !errors.Is(err, tenancy.ErrNoTenant) {
+			t.Errorf("%s gave %v, want ErrNoTenant", name, err)
 		}
 	}
+}
 
-	member, err := f.store.IsMember(ctx, f.acmeID, principal{kind: "user", key: f.adaInAcme})
+// A soft-deleted tenant has released its slug and must not resolve.
+func TestLookupIgnoresASoftDeletedTenant(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+
+	if _, err := f.owner.ExecContext(ctx,
+		`UPDATE `+tenantsTable+` SET deleted_at = now() WHERE id = $1`, f.globexID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Lookup(ctx, tenancy.Identifier{Kind: tenancy.KindSlug, Value: "pgs-globex"}); !errors.Is(err, tenancy.ErrNoTenant) {
+		t.Fatalf("a soft-deleted tenant resolved: %v", err)
+	}
+}
+
+// The claim this package exists to make: the membership query carries no
+// tenant predicate, and still cannot see another tenant's members.
+func TestMembershipIsScopedByThisPackage(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+
+	ada := principal{kind: "user", key: "ada"}
+	grace := principal{kind: "user", key: "grace"}
+
+	for name, tc := range map[string]struct {
+		tenant    string
+		principal tenancy.Principal
+		want      bool
+	}{
+		"a member of acme, in acme":     {f.acmeID, ada, true},
+		"a member of globex, in globex": {f.globexID, grace, true},
+		"a member of globex, in acme":   {f.acmeID, grace, false},
+		"a member of acme, in globex":   {f.globexID, ada, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			member, err := f.store.IsMember(ctx, tc.tenant, tc.principal)
+			if err != nil {
+				t.Fatalf("IsMember: %v", err)
+			}
+			if member != tc.want {
+				t.Errorf("IsMember = %v, want %v", member, tc.want)
+			}
+		})
+	}
+}
+
+func TestADeactivatedMemberIsNotAMember(t *testing.T) {
+	f := setup(t)
+	member, err := f.store.IsMember(context.Background(), f.globexID, principal{kind: "user", key: "departed"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if member {
-		t.Fatal("a deactivated user is still a member")
+		t.Error("a deactivated row was counted as a membership")
 	}
 }
 
 func TestNoPrincipalIsNoMember(t *testing.T) {
 	f := setup(t)
-	got, err := f.store.IsMember(context.Background(), f.acmeID, nil)
-	if err != nil || got {
-		t.Fatalf("IsMember(nil) = %v, %v", got, err)
+	member, err := f.store.IsMember(context.Background(), f.acmeID, nil)
+	if err != nil {
+		t.Fatalf("a nil principal should not be an error: %v", err)
+	}
+	if member {
+		t.Error("nobody was reported as a member")
 	}
 }
 
-// An unimplemented population is an error, not a quiet false. A quiet false
-// would present as a baffling permission problem rather than as the missing
-// implementation it is.
-func TestAnUnknownPrincipalKindIsAnError(t *testing.T) {
+// A store with no membership query reports that, rather than answering no.
+//
+// "Nobody is a member of anything" is a sign-in that always fails and reads
+// as a permissions bug; the missing configuration should say so.
+func TestAStoreWithNoMembershipQuerySaysSo(t *testing.T) {
 	f := setup(t)
-	_, err := f.store.IsMember(context.Background(), f.acmeID, principal{kind: "superuser", key: "7"})
-	if err == nil {
-		t.Fatal("want an error for a principal kind with no membership rule")
-	}
-}
+	bare := pgstore.New(f.owner, config(nil))
 
-// Authorize over the real store: the whole path a header takes.
-func TestAuthorizeRefusesAHeaderNamingAnotherWorkspace(t *testing.T) {
-	f := setup(t)
-	ctx := context.Background()
-	ada := principal{kind: "user", key: f.adaInAcme}
-
-	mine := tenancy.Identification{Workspace: tenancy.Identifier{
-		Kind: tenancy.KindSlug, Value: "pgs-acme", Source: tenancy.SourceHeader}}
-	if _, err := tenancy.Authorize(ctx, f.store, mine, ada); err != nil {
-		t.Fatalf("ada should reach her own workspace: %v", err)
-	}
-
-	theirs := tenancy.Identification{Workspace: tenancy.Identifier{
-		Kind: tenancy.KindSlug, Value: "pgs-globex", Source: tenancy.SourceHeader}}
-	if _, err := tenancy.Authorize(ctx, f.store, theirs, ada); !errors.Is(err, tenancy.ErrNoWorkspace) {
-		t.Fatalf("want ErrNoWorkspace, got %v", err)
+	_, err := bare.IsMember(context.Background(), f.acmeID, principal{kind: "user", key: "ada"})
+	if !errors.Is(err, pgstore.ErrNoMembershipQuery) {
+		t.Fatalf("IsMember with no query gave %v, want ErrNoMembershipQuery", err)
 	}
 }

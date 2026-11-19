@@ -6,16 +6,16 @@ import (
 	"testing"
 )
 
-// A registry over two workspaces. ada belongs to acme only.
+// A registry over two tenants. ada belongs to acme only.
 type fakeRegistry struct {
-	workspaces []Workspace
-	members    map[string][]string // workspace id -> principal keys
+	tenants []Tenant
+	members    map[string][]string // tenant id -> principal keys
 	lookups    int
 }
 
 func newFakeRegistry() *fakeRegistry {
 	return &fakeRegistry{
-		workspaces: []Workspace{
+		tenants: []Tenant{
 			{ID: "11111111-1111-1111-1111-111111111111", Slug: "acme", Name: "Acme", Status: StatusActive},
 			{ID: "22222222-2222-2222-2222-222222222222", Slug: "globex", Name: "Globex", Status: StatusActive},
 			{ID: "33333333-3333-3333-3333-333333333333", Slug: "dormant", Name: "Dormant", Status: StatusSuspended},
@@ -27,18 +27,18 @@ func newFakeRegistry() *fakeRegistry {
 	}
 }
 
-func (f *fakeRegistry) Lookup(_ context.Context, id Identifier) (Workspace, error) {
+func (f *fakeRegistry) Lookup(_ context.Context, id Identifier) (Tenant, error) {
 	f.lookups++
-	for _, w := range f.workspaces {
+	for _, w := range f.tenants {
 		if (id.Kind == KindSlug && w.Slug == id.Value) || (id.Kind == KindID && w.ID == id.Value) {
 			return w, nil
 		}
 	}
-	return Workspace{}, ErrNoWorkspace
+	return Tenant{}, ErrNoTenant
 }
 
-func (f *fakeRegistry) IsMember(_ context.Context, workspaceID string, p Principal) (bool, error) {
-	for _, key := range f.members[workspaceID] {
+func (f *fakeRegistry) IsMember(_ context.Context, tenantID string, p Principal) (bool, error) {
+	for _, key := range f.members[tenantID] {
 		if key == p.PrincipalKey() {
 			return true, nil
 		}
@@ -52,12 +52,12 @@ func (u user) PrincipalKind() string { return "user" }
 func (u user) PrincipalKey() string  { return string(u) }
 
 func headerIdent(value string, kind Kind) Identification {
-	return Identification{Workspace: Identifier{Kind: kind, Value: value, Source: SourceHeader}}
+	return Identification{Tenant: Identifier{Kind: kind, Value: value, Source: SourceHeader}}
 }
 
 // THE test. A header is a string from the internet; membership is what makes
 // it safe.
-func TestAHeaderNamingAnotherWorkspaceIsRefused(t *testing.T) {
+func TestAHeaderNamingAnotherTenantIsRefused(t *testing.T) {
 	reg := newFakeRegistry()
 
 	// ada is a member of acme. She asks for globex by slug, and by uuid.
@@ -67,16 +67,16 @@ func TestAHeaderNamingAnotherWorkspaceIsRefused(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Authorize(context.Background(), reg, ident, user("ada"))
-			if !errors.Is(err, ErrNoWorkspace) {
-				t.Fatalf("want ErrNoWorkspace, got %v", err)
+			if !errors.Is(err, ErrNoTenant) {
+				t.Fatalf("want ErrNoTenant, got %v", err)
 			}
 		})
 	}
 }
 
-// And the refusal must be indistinguishable from "no such workspace", or the
+// And the refusal must be indistinguishable from "no such tenant", or the
 // error is an oracle for which companies are customers.
-func TestARefusalLooksTheSameAsANonexistentWorkspace(t *testing.T) {
+func TestARefusalLooksTheSameAsANonexistentTenant(t *testing.T) {
 	reg := newFakeRegistry()
 	ctx := context.Background()
 
@@ -92,14 +92,14 @@ func TestARefusalLooksTheSameAsANonexistentWorkspace(t *testing.T) {
 	}
 }
 
-func TestAMemberIsBoundToTheWorkspaceTheRegistryResolved(t *testing.T) {
+func TestAMemberIsBoundToTheTenantTheRegistryResolved(t *testing.T) {
 	reg := newFakeRegistry()
 	binding, err := Authorize(context.Background(), reg, headerIdent("acme", KindSlug), user("ada"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The binding carries the resolved uuid, not the string from the header.
-	if binding.Workspace.ID != "11111111-1111-1111-1111-111111111111" {
+	if binding.Tenant.ID != "11111111-1111-1111-1111-111111111111" {
 		t.Fatalf("binding = %+v", binding)
 	}
 	if binding.Source != SourceHeader {
@@ -108,7 +108,7 @@ func TestAMemberIsBoundToTheWorkspaceTheRegistryResolved(t *testing.T) {
 }
 
 // A header with nobody authenticated behind it is just a string.
-func TestAHeaderNamedWorkspaceNeedsAPrincipal(t *testing.T) {
+func TestAHeaderNamedTenantNeedsAPrincipal(t *testing.T) {
 	reg := newFakeRegistry()
 	_, err := Authorize(context.Background(), reg, headerIdent("acme", KindSlug), nil)
 	if !errors.Is(err, ErrNoPrincipal) {
@@ -116,35 +116,35 @@ func TestAHeaderNamedWorkspaceNeedsAPrincipal(t *testing.T) {
 	}
 }
 
-// But a host-named workspace resolves for an anonymous visitor, who has to be
+// But a host-named tenant resolves for an anonymous visitor, who has to be
 // able to reach the sign-in page.
-func TestAHostNamedWorkspaceResolvesForAnAnonymousVisitor(t *testing.T) {
+func TestAHostNamedTenantResolvesForAnAnonymousVisitor(t *testing.T) {
 	reg := newFakeRegistry()
-	ident := Identification{Workspace: Identifier{Kind: KindSlug, Value: "acme", Source: SourceHost}}
+	ident := Identification{Tenant: Identifier{Kind: KindSlug, Value: "acme", Source: SourceHost}}
 	binding, err := Authorize(context.Background(), reg, ident, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.Workspace.Slug != "acme" {
+	if binding.Tenant.Slug != "acme" {
 		t.Fatalf("binding = %+v", binding)
 	}
 }
 
-func TestASuspendedWorkspaceDoesNotServe(t *testing.T) {
+func TestASuspendedTenantDoesNotServe(t *testing.T) {
 	reg := newFakeRegistry()
-	ident := Identification{Workspace: Identifier{Kind: KindSlug, Value: "dormant", Source: SourceHost}}
+	ident := Identification{Tenant: Identifier{Kind: KindSlug, Value: "dormant", Source: SourceHost}}
 	_, err := Authorize(context.Background(), reg, ident, nil)
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("want ErrUnavailable, got %v", err)
 	}
 }
 
-// A delinquent workspace still signs in; billing redirects it later. If this
+// A delinquent tenant still signs in; billing redirects it later. If this
 // ever returns ErrUnavailable, an unpaid customer cannot reach the page that
 // takes their money.
-func TestADelinquentWorkspaceStillServes(t *testing.T) {
+func TestADelinquentTenantStillServes(t *testing.T) {
 	if !StatusDelinquent.Serves() {
-		t.Fatal("a delinquent workspace must still serve, or it cannot reach its billing page")
+		t.Fatal("a delinquent tenant must still serve, or it cannot reach its billing page")
 	}
 	if StatusSuspended.Serves() || StatusArchived.Serves() {
 		t.Fatal("suspended and archived must not serve")
@@ -155,7 +155,7 @@ func TestADelinquentWorkspaceStillServes(t *testing.T) {
 // contradiction is refused rather than resolved in anyone's favour.
 func TestAContradictoryIDHeaderIsRefused(t *testing.T) {
 	reg := newFakeRegistry()
-	ident := Identification{Workspace: Identifier{
+	ident := Identification{Tenant: Identifier{
 		Kind:          KindSlug,
 		Value:         "acme",
 		Source:        SourceHost,
@@ -166,15 +166,15 @@ func TestAContradictoryIDHeaderIsRefused(t *testing.T) {
 	}
 
 	// Agreement passes.
-	ident.Workspace.MustAgreeWith = "11111111-1111-1111-1111-111111111111"
+	ident.Tenant.MustAgreeWith = "11111111-1111-1111-1111-111111111111"
 	if _, err := Authorize(context.Background(), reg, ident, user("ada")); err != nil {
 		t.Fatalf("agreement should pass: %v", err)
 	}
 }
 
-func TestNamingNoWorkspaceIsRefused(t *testing.T) {
+func TestNamingNoTenantIsRefused(t *testing.T) {
 	reg := newFakeRegistry()
-	if _, err := Authorize(context.Background(), reg, Identification{}, user("ada")); !errors.Is(err, ErrNoWorkspace) {
-		t.Fatalf("want ErrNoWorkspace, got %v", err)
+	if _, err := Authorize(context.Background(), reg, Identification{}, user("ada")); !errors.Is(err, ErrNoTenant) {
+		t.Fatalf("want ErrNoTenant, got %v", err)
 	}
 }

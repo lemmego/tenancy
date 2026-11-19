@@ -9,15 +9,15 @@ import (
 
 	_ "github.com/lib/pq"
 
-	"github.com/lemmego/fieldbubble/tenancy/rls"
+	"github.com/lemmego/tenancy/rls"
 )
 
 // These tests need a real PostgreSQL, because row-level security cannot be
 // faked and the whole point is to prove the database enforces it.
 //
-//	FIELDBUBBLE_OWNER_DSN  — a role that owns the tables and runs migrations
-//	FIELDBUBBLE_APP_DSN    — the role the application connects as
-//	FIELDBUBBLE_SUPER_DSN  — optional: a superuser, used to prove the
+//	TENANCY_OWNER_DSN  — a role that owns the tables and runs migrations
+//	TENANCY_APP_DSN    — the role the application connects as
+//	TENANCY_SUPER_DSN  — optional: a superuser, used to prove the
 //	                         vacuity trap is real rather than theoretical
 //
 // They skip without them, which is a real hole: a skipped test and a passing
@@ -27,6 +27,21 @@ const (
 	alpha = "11111111-1111-1111-1111-111111111111"
 	beta  = "22222222-2222-2222-2222-222222222222"
 )
+
+// testConfig is the configuration this suite protects its fixtures with.
+//
+// A deliberately non-default setting name, so a test that accidentally read
+// the package default would see nothing rather than quietly pass.
+func testConfig() rls.Config {
+	return rls.Config{
+		Setting: "tenancy_test.tenant_id",
+		Column:  "tenant_id",
+		Unscoped: map[string]string{
+			"tenants": "the tenant table itself: a row in it cannot be scoped " +
+				"to the tenant it defines",
+		},
+	}
+}
 
 func dsn(t *testing.T, name string) string {
 	t.Helper()
@@ -51,11 +66,11 @@ func open(t *testing.T, name string) *sql.DB {
 }
 
 // setup creates a tenant-scoped table as the owner, protects it, and seeds
-// one row per workspace. Seeding is done as the OWNER with FORCE suspended,
+// one row per tenant. Seeding is done as the OWNER with FORCE suspended,
 // which is the same escape hatch a data migration uses.
 func setup(t *testing.T, table string) {
 	t.Helper()
-	owner := open(t, "FIELDBUBBLE_OWNER_DSN")
+	owner := open(t, "TENANCY_OWNER_DSN")
 	ctx := context.Background()
 
 	_, _ = owner.ExecContext(ctx, `DROP TABLE IF EXISTS `+table)
@@ -69,13 +84,13 @@ func setup(t *testing.T, table string) {
 	if _, err := tx.ExecContext(ctx, `
 		CREATE TABLE `+table+` (
 			id            bigserial PRIMARY KEY,
-			workspace_id  uuid NOT NULL,
+			tenant_id  uuid NOT NULL,
 			title         text NOT NULL,
-			UNIQUE (workspace_id, id)
+			UNIQUE (tenant_id, id)
 		)`); err != nil {
 		t.Fatal(err)
 	}
-	if err := rls.Enable(tx, table); err != nil {
+	if err := testConfig().Enable(tx, table); err != nil {
 		t.Fatal(err)
 	}
 	// Seed as the owner, with FORCE lifted, exactly as a data migration must.
@@ -83,7 +98,7 @@ func setup(t *testing.T, table string) {
 		t.Fatal(err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO `+table+` (workspace_id, title) VALUES ($1,'alpha row'),($2,'beta row')`,
+		`INSERT INTO `+table+` (tenant_id, title) VALUES ($1,'alpha row'),($2,'beta row')`,
 		alpha, beta); err != nil {
 		t.Fatal(err)
 	}
@@ -96,9 +111,9 @@ func setup(t *testing.T, table string) {
 	t.Cleanup(func() { _, _ = owner.Exec(`DROP TABLE IF EXISTS ` + table) })
 }
 
-// countAs reads the table through db, scoped to workspace, and returns how
+// countAs reads the table through db, scoped to tenant, and returns how
 // many rows it could see.
-func countAs(t *testing.T, db *sql.DB, table, workspace string) int {
+func countAs(t *testing.T, db *sql.DB, table, tenant string) int {
 	t.Helper()
 	ctx := context.Background()
 	tx, err := db.BeginTx(ctx, nil)
@@ -107,8 +122,8 @@ func countAs(t *testing.T, db *sql.DB, table, workspace string) int {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if workspace != "" {
-		if err := rls.SetLocal(ctx, tx, workspace); err != nil {
+	if tenant != "" {
+		if err := testConfig().SetLocal(ctx, tx, tenant); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -119,9 +134,9 @@ func countAs(t *testing.T, db *sql.DB, table, workspace string) int {
 	return n
 }
 
-func TestTheDatabaseRefusesACrossWorkspaceRead(t *testing.T) {
+func TestTheDatabaseRefusesACrossTenantRead(t *testing.T) {
 	setup(t, "rls_docs")
-	app := open(t, "FIELDBUBBLE_APP_DSN")
+	app := open(t, "TENANCY_APP_DSN")
 
 	if got := countAs(t, app, "rls_docs", alpha); got != 1 {
 		t.Fatalf("scoped to alpha the app saw %d rows, want exactly its own 1", got)
@@ -136,7 +151,7 @@ func TestTheDatabaseRefusesACrossWorkspaceRead(t *testing.T) {
 // current_setting(..., true) and nullif rather than a plain comparison.
 func TestAnUnscopedReadSeesNothing(t *testing.T) {
 	setup(t, "rls_unscoped")
-	app := open(t, "FIELDBUBBLE_APP_DSN")
+	app := open(t, "TENANCY_APP_DSN")
 
 	if got := countAs(t, app, "rls_unscoped", ""); got != 0 {
 		t.Fatalf("an unscoped read saw %d rows, want 0 — the policy is failing OPEN", got)
@@ -144,11 +159,11 @@ func TestAnUnscopedReadSeesNothing(t *testing.T) {
 }
 
 // WITH CHECK, not just USING. Without it a row can be moved to another
-// workspace by an UPDATE that USING permits, because USING only inspects the
+// tenant by an UPDATE that USING permits, because USING only inspects the
 // row as it was before the change.
-func TestARowCannotBeMovedToAnotherWorkspace(t *testing.T) {
+func TestARowCannotBeMovedToAnotherTenant(t *testing.T) {
 	setup(t, "rls_move")
-	app := open(t, "FIELDBUBBLE_APP_DSN")
+	app := open(t, "TENANCY_APP_DSN")
 	ctx := context.Background()
 
 	tx, err := app.BeginTx(ctx, nil)
@@ -156,20 +171,20 @@ func TestARowCannotBeMovedToAnotherWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := rls.SetLocal(ctx, tx, alpha); err != nil {
+	if err := testConfig().SetLocal(ctx, tx, alpha); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = tx.ExecContext(ctx, `UPDATE rls_move SET workspace_id = $1`, beta)
+	_, err = tx.ExecContext(ctx, `UPDATE rls_move SET tenant_id = $1`, beta)
 	if err == nil {
-		t.Fatal("the app moved its own row into another workspace; the policy has no WITH CHECK")
+		t.Fatal("the app moved its own row into another tenant; the policy has no WITH CHECK")
 	}
 }
 
-// An insert naming another workspace is refused by WITH CHECK.
-func TestAnInsertIntoAnotherWorkspaceIsRefused(t *testing.T) {
+// An insert naming another tenant is refused by WITH CHECK.
+func TestAnInsertIntoAnotherTenantIsRefused(t *testing.T) {
 	setup(t, "rls_insert")
-	app := open(t, "FIELDBUBBLE_APP_DSN")
+	app := open(t, "TENANCY_APP_DSN")
 	ctx := context.Background()
 
 	tx, err := app.BeginTx(ctx, nil)
@@ -177,13 +192,13 @@ func TestAnInsertIntoAnotherWorkspaceIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := rls.SetLocal(ctx, tx, alpha); err != nil {
+	if err := testConfig().SetLocal(ctx, tx, alpha); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO rls_insert (workspace_id, title) VALUES ($1,'planted')`, beta); err == nil {
-		t.Fatal("the app inserted a row into another workspace")
+		`INSERT INTO rls_insert (tenant_id, title) VALUES ($1,'planted')`, beta); err == nil {
+		t.Fatal("the app inserted a row into another tenant")
 	}
 }
 
@@ -193,7 +208,7 @@ func TestAnInsertIntoAnotherWorkspaceIsRefused(t *testing.T) {
 // proving nothing.
 func TestASuperuserBypassesEverythingWhichIsWhyTheRoleMatters(t *testing.T) {
 	setup(t, "rls_bypass")
-	super := open(t, "FIELDBUBBLE_SUPER_DSN")
+	super := open(t, "TENANCY_SUPER_DSN")
 
 	got := countAs(t, super, "rls_bypass", alpha)
 	if got != 2 {
@@ -207,13 +222,13 @@ func TestAssertNotPrivileged(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("passes for the application role", func(t *testing.T) {
-		if err := rls.AssertNotPrivileged(ctx, open(t, "FIELDBUBBLE_APP_DSN")); err != nil {
+		if err := rls.AssertNotPrivileged(ctx, open(t, "TENANCY_APP_DSN")); err != nil {
 			t.Fatalf("the application role should be unprivileged: %v", err)
 		}
 	})
 
 	t.Run("refuses a superuser", func(t *testing.T) {
-		err := rls.AssertNotPrivileged(ctx, open(t, "FIELDBUBBLE_SUPER_DSN"))
+		err := rls.AssertNotPrivileged(ctx, open(t, "TENANCY_SUPER_DSN"))
 		if !errors.Is(err, rls.ErrPrivileged) {
 			t.Fatalf("want ErrPrivileged, got %v", err)
 		}
@@ -223,26 +238,26 @@ func TestAssertNotPrivileged(t *testing.T) {
 // Proves the setting is transaction-local against this database and whatever
 // sits in front of it.
 func TestSelfTest(t *testing.T) {
-	if err := rls.SelfTest(context.Background(), open(t, "FIELDBUBBLE_APP_DSN")); err != nil {
+	if err := testConfig().SelfTest(context.Background(), open(t, "TENANCY_APP_DSN")); err != nil {
 		t.Fatalf("self-test failed: %v", err)
 	}
 }
 
 // The realistic failure is not a broken policy; it is a table added with a
-// workspace_id column and no policy, which nothing notices.
+// tenant_id column and no policy, which nothing notices.
 func TestConformanceCatchesAnUnprotectedTable(t *testing.T) {
-	owner := open(t, "FIELDBUBBLE_OWNER_DSN")
+	owner := open(t, "TENANCY_OWNER_DSN")
 	ctx := context.Background()
 
 	_, _ = owner.ExecContext(ctx, `DROP TABLE IF EXISTS rls_forgotten`)
 	if _, err := owner.ExecContext(ctx, `
 		CREATE TABLE rls_forgotten (
-			id bigserial PRIMARY KEY, workspace_id uuid NOT NULL, title text)`); err != nil {
+			id bigserial PRIMARY KEY, tenant_id uuid NOT NULL, title text)`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = owner.Exec(`DROP TABLE IF EXISTS rls_forgotten`) })
 
-	findings, err := rls.Conformance(ctx, owner)
+	findings, err := testConfig().Conformance(ctx, owner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,60 +268,108 @@ func TestConformanceCatchesAnUnprotectedTable(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("a table with a workspace_id column and no policy was not reported: %v", findings)
+		t.Fatalf("a table with a tenant_id column and no policy was not reported: %v", findings)
 	}
 	if err := rls.FindingsError(findings); err == nil {
 		t.Fatal("FindingsError should report a non-empty finding set")
 	}
 }
 
-// The gate. Not "the checker can spot a broken table" — the schema this
-// application actually has is protected, every table of it.
+// A declared exemption that has quietly acquired a policy is reported.
 //
-// This is the test that fails the day somebody adds a table with a
-// workspace_id and forgets the policy, which is the failure the whole design
-// is most exposed to: nothing else about that table looks wrong, the page
-// works, and the data is visible to every tenant.
-func TestTheSchemaInFrontOfUsIsConformant(t *testing.T) {
-	owner := open(t, "FIELDBUBBLE_OWNER_DSN")
+// The inverse mistake, and worth catching because its symptom is baffling
+// rather than loud: an exempt table with a policy answers nothing to
+// everybody — the registry lookup that establishes the scope cannot run —
+// while the table looks correctly protected to anybody auditing it.
+//
+// Against a fixture, because the version this replaces declared a table the
+// database did not have, and UnscopedConformance skips what is absent by
+// design. It passed without examining anything.
+func TestADeclaredExemptionThatGainedAPolicyIsReported(t *testing.T) {
+	owner := open(t, "TENANCY_OWNER_DSN")
 	ctx := context.Background()
 
-	findings, err := rls.Conformance(ctx, owner)
+	const table = "rls_registry"
+	_, _ = owner.ExecContext(ctx, `DROP TABLE IF EXISTS `+table)
+	if _, err := owner.ExecContext(ctx, `
+		CREATE TABLE `+table+` (id bigserial PRIMARY KEY, tenant_id uuid NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = owner.Exec(`DROP TABLE IF EXISTS ` + table) })
+
+	cfg := testConfig()
+	cfg.Unscoped = map[string]string{
+		table: "declared by this test as the registry, read before a tenant is known",
+	}
+
+	// Exempt and unprotected: nothing to report.
+	findings, err := cfg.UnscopedConformance(ctx, owner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := rls.FindingsError(findings); err != nil {
-		t.Fatalf("the live schema is not conformant:\n%v", err)
+		t.Fatalf("an exempt table with no policy was reported:\n%v", err)
 	}
-}
 
-// And the inverse: a table declared unscoped must not have quietly acquired
-// a policy, because an exempt table with a policy answers nothing to
-// everybody — the console would list no workspaces and every host would
-// 404 — while looking correctly protected to anyone auditing it.
-func TestTheRegistryTablesAreStillUnscoped(t *testing.T) {
-	owner := open(t, "FIELDBUBBLE_OWNER_DSN")
-	ctx := context.Background()
-
-	findings, err := rls.UnscopedConformance(ctx, owner)
+	// Now protect it, which is the mistake.
+	tx, err := owner.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := rls.FindingsError(findings); err != nil {
-		t.Fatalf("a declared registry table is scoped after all:\n%v", err)
+	if err := cfg.Enable(tx, table); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err = cfg.UnscopedConformance(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rls.FindingsError(findings) == nil {
+		t.Fatal("a table declared unscoped was given a policy and nothing reported it")
 	}
 }
 
-// Every exemption carries a reason, and the reason is what makes the list
-// reviewable rather than a place to hide a table.
-func TestEveryExemptionIsExplained(t *testing.T) {
-	unscoped := rls.Unscoped()
-	if len(unscoped) == 0 {
-		t.Fatal("no registry tables are declared, so workspaces itself would be reported")
-	}
-	for table, reason := range unscoped {
-		if len(reason) < 40 {
-			t.Errorf("%s is exempt with only %q, which is not a reason", table, reason)
+// A declared exemption exempts, and an undeclared table does not.
+//
+// The old version of this test asserted that every entry in a hardcoded list
+// carried a long enough reason. That list belongs to the application now, so
+// what is testable here is the behaviour: Conformance skips what the caller
+// declared and reports what it did not.
+func TestAnExemptionExemptsAndNothingElseDoes(t *testing.T) {
+	owner := open(t, "TENANCY_OWNER_DSN")
+	ctx := context.Background()
+
+	for _, table := range []string{"rls_exempt", "rls_unprotected"} {
+		_, _ = owner.ExecContext(ctx, `DROP TABLE IF EXISTS `+table)
+		if _, err := owner.ExecContext(ctx, `
+			CREATE TABLE `+table+` (
+				id bigserial PRIMARY KEY, tenant_id uuid NOT NULL)`); err != nil {
+			t.Fatal(err)
 		}
+		t.Cleanup(func() { _, _ = owner.Exec(`DROP TABLE IF EXISTS ` + table) })
+	}
+
+	cfg := testConfig()
+	cfg.Unscoped = map[string]string{
+		"rls_exempt": "declared by this test as read before a tenant is known",
+	}
+
+	findings, err := cfg.Conformance(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reported := map[string]bool{}
+	for _, f := range findings {
+		reported[f.Table] = true
+	}
+	if reported["rls_exempt"] {
+		t.Error("a declared exemption was reported anyway, so the list does nothing")
+	}
+	if !reported["rls_unprotected"] {
+		t.Error("an undeclared table with a tenant column was not reported, " +
+			"so the check would miss the failure it exists for")
 	}
 }

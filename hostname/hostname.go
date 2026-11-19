@@ -1,5 +1,5 @@
 // Package hostname turns a request's Host header into a surface and, when the
-// host names a workspace, its slug.
+// host names a tenant, its slug.
 //
 // It is pure: no database, no cache, no HTTP. That is deliberate, because this
 // is the function that decides whether a request is talking to the platform,
@@ -20,19 +20,19 @@ type Surface uint8
 const (
 	SurfaceUnknown Surface = iota
 
-	// SurfaceMarketing is the bare apex: fieldbubble.com.
+	// SurfaceMarketing is the bare apex: example.com.
 	SurfaceMarketing
 
-	// SurfacePlatform is sys.fieldbubble.com, for the people who run the
+	// SurfacePlatform is sys.example.com, for the people who run the
 	// platform.
 	SurfacePlatform
 
-	// SurfaceConsole is app.fieldbubble.com, where a customer signs in and
-	// sees the workspaces they own.
+	// SurfaceConsole is app.example.com, where a customer signs in and
+	// sees the tenants they own.
 	SurfaceConsole
 
-	// SurfaceWorkspace is acme.fieldbubble.com: one tenant.
-	SurfaceWorkspace
+	// SurfaceTenant is acme.example.com: one tenant.
+	SurfaceTenant
 )
 
 func (s Surface) String() string {
@@ -43,8 +43,8 @@ func (s Surface) String() string {
 		return "platform"
 	case SurfaceConsole:
 		return "console"
-	case SurfaceWorkspace:
-		return "workspace"
+	case SurfaceTenant:
+		return "tenant"
 	}
 	return "unknown"
 }
@@ -64,7 +64,7 @@ var (
 // Config is the one piece of deployment knowledge this package needs.
 type Config struct {
 	// AppDomain is the bare domain, no scheme and no port:
-	// "fieldbubble.localhost" in development, "fieldbubble.com" in
+	// "example.localhost" in development, "example.com" in
 	// production. It is the ONLY thing that differs between the two, which
 	// is why there is no development branch anywhere below.
 	AppDomain string
@@ -73,7 +73,7 @@ type Config struct {
 	PlatformLabel string
 	ConsoleLabel  string
 
-	// Reserved labels nobody may register as a workspace.
+	// Reserved labels nobody may register as a tenant.
 	Reserved map[string]struct{}
 }
 
@@ -95,7 +95,7 @@ func (c Config) consoleLabel() string {
 type Result struct {
 	Surface Surface
 
-	// Slug is the workspace label, set only for SurfaceWorkspace.
+	// Slug is the tenant label, set only for SurfaceTenant.
 	Slug string
 }
 
@@ -119,14 +119,14 @@ func Resolve(rawHost string, cfg Config) (Result, error) {
 
 	// Both conditions are needed, and the second is the one that matters.
 	//
-	// A suffix test alone accepts evil.acme.fieldbubble.com, and a naive
+	// A suffix test alone accepts evil.acme.example.com, and a naive
 	// prefix-strip would then read the label as "evil.acme" — or, worse,
 	// somebody "helpfully" takes the first label and serves acme's data to a
 	// host acme does not control. Requiring exactly one more label than the
 	// app domain refuses the whole shape.
 	//
 	// Comparing label DEPTH rather than string length is also what makes
-	// fieldbubble.localhost (2 labels) and fieldbubble.com (2 labels) behave
+	// example.localhost (2 labels) and example.com (2 labels) behave
 	// identically, so there is no development special case to get wrong.
 	if !strings.HasSuffix(host, "."+domain) {
 		return Result{}, fmt.Errorf("%w: %q", ErrUnknownHost, host)
@@ -147,10 +147,10 @@ func Resolve(rawHost string, cfg Config) (Result, error) {
 	}
 
 	// Deliberately NOT validated against the slug pattern here. A host that
-	// looks like a slug but names no workspace is a 404 from the registry,
+	// looks like a slug but names no tenant is a 404 from the registry,
 	// and the pattern is a rule about what may be *created*. Enforcing it in
 	// two places means maintaining two copies that will one day disagree.
-	return Result{Surface: SurfaceWorkspace, Slug: label}, nil
+	return Result{Surface: SurfaceTenant, Slug: label}, nil
 }
 
 // normalise lowercases, strips the port and the root dot, and rejects
@@ -184,7 +184,7 @@ func labels(host string) int { return strings.Count(host, ".") + 1 }
 // DefaultReserved is a starting list of labels nobody may register.
 //
 // It is long on purpose. Each entry is either a surface we serve, a hostname
-// somebody will expect to be ours, or a name that would let a workspace
+// somebody will expect to be ours, or a name that would let a tenant
 // impersonate the platform in an email or a support conversation.
 func DefaultReserved() map[string]struct{} {
 	labels := []string{
@@ -200,7 +200,7 @@ func DefaultReserved() map[string]struct{} {
 		"demo", "sandbox", "preview", "local", "localhost",
 		"mobile", "ws", "wss", "socket", "sockets", "queue", "worker", "workers",
 		"metrics", "health", "healthz", "grafana", "prometheus", "kibana",
-		"fieldbubble", "security", "abuse", "postmaster", "hostmaster", "webmaster", "noc",
+		"security", "abuse", "postmaster", "hostmaster", "webmaster", "noc",
 		"legal", "privacy", "terms", "trust", "noreply", "no-reply",
 	}
 	reserved := make(map[string]struct{}, len(labels))
@@ -215,9 +215,9 @@ func DefaultReserved() map[string]struct{} {
 // Separate from ErrMalformed, which is about a whole host: this is the rule
 // about what may be REGISTERED, and the caller wants to show it to somebody
 // filling in a form.
-var ErrBadLabel = errors.New("hostname: unusable workspace label")
+var ErrBadLabel = errors.New("hostname: unusable tenant label")
 
-// ValidateLabel reports whether a label may be registered as a workspace,
+// ValidateLabel reports whether a label may be registered as a tenant,
 // and returns it in its canonical form.
 //
 // # Why this resolves rather than compares
@@ -225,7 +225,7 @@ var ErrBadLabel = errors.New("hostname: unusable workspace label")
 // The second half of the check is not a list of forbidden names: it builds
 // the host the label would answer on and asks Resolve what that host means.
 // A label is registrable exactly when a host made from it resolves to a
-// workspace with that slug.
+// tenant with that slug.
 //
 // That makes creation and resolution the same code, which is the only way
 // the two cannot drift. A hand-written copy of the rules would have to
@@ -233,12 +233,12 @@ var ErrBadLabel = errors.New("hostname: unusable workspace label")
 // the normalisation — and the configured surface labels are the ones it
 // would miss: set CONSOLE_LABEL=portal and "portal" must become
 // unregistrable, because Resolve matches the surface labels before anything
-// else and a workspace called portal would be a workspace nobody can reach.
+// else and a tenant called portal would be a tenant nobody can reach.
 //
 // Resolve deliberately does NOT enforce the slug pattern — a host that looks
-// like a slug but names no workspace is a 404 from the registry, not a
+// like a slug but names no tenant is a 404 from the registry, not a
 // malformed request — so the shape rule is applied here, where it belongs.
-// It is the same rule as the CHECK constraint on the workspaces table, and
+// It is the same rule as the CHECK constraint on the tenants table, and
 // the application has a test that the two agree.
 func ValidateLabel(raw string, cfg Config) (string, error) {
 	label := strings.ToLower(strings.TrimSpace(raw))
@@ -252,16 +252,16 @@ func ValidateLabel(raw string, cfg Config) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if result.Surface != SurfaceWorkspace || result.Slug != label {
+	if result.Surface != SurfaceTenant || result.Slug != label {
 		// Reachable when the label is a configured surface label, which
-		// Resolve answers before it ever considers a workspace.
+		// Resolve answers before it ever considers a tenant.
 		return "", fmt.Errorf("%w: %q is the %s surface", ErrReserved, label, result.Surface)
 	}
 	return label, nil
 }
 
 // labelShape is the registrable-slug rule, and it is deliberately the same
-// expression as the workspaces_slug_shape CHECK constraint:
+// expression as the tenants_slug_shape CHECK constraint:
 //
 //	^[a-z0-9]([a-z0-9-]{1,30})[a-z0-9]$
 //

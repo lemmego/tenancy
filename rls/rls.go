@@ -29,14 +29,67 @@ import (
 	"strings"
 )
 
-// GUC is the session variable a policy reads.
+// DefaultSetting and DefaultColumn are what an application gets if it says
+// nothing.
 //
-// It must be a two-part name — PostgreSQL requires a prefix for a custom
-// setting — and the prefix is ours so nothing else can collide with it.
-const GUC = "fieldbubble.workspace_id"
+// The setting must be a two-part name — PostgreSQL requires a prefix for a
+// custom setting — and an application should namespace it to itself rather
+// than take this default, so that two libraries reading "app.tenant_id" in
+// one database cannot mean different things by it.
+const (
+	DefaultSetting = "app.tenant_id"
+	DefaultColumn  = "tenant_id"
+)
 
-// TenantColumn is the column every tenant-scoped table carries.
-const TenantColumn = "workspace_id"
+// Config is the two names this package needs, plus the tables it must not
+// police.
+//
+// Parameterised rather than fixed because the column is part of an
+// application's schema and the setting is part of its namespace, and a
+// framework that hardcoded either would be telling every consumer to rename
+// its tables. The zero value is usable: see WithDefaults.
+type Config struct {
+	// Setting is the transaction-local setting a policy reads.
+	Setting string
+
+	// Column is the tenant column every scoped table carries.
+	//
+	// It has to agree with the `orm:"tenantKey"` field on the models, and
+	// that tag is compile-time — so an application whose column is not
+	// DefaultColumn declares its own four-line embed instead of using
+	// tenancy.Scoped, and sets this to match.
+	Column string
+
+	// Unscoped names tables that carry Column and deliberately have no
+	// policy, with the reason for each.
+	//
+	// # Why an exemption list exists at all
+	//
+	// Conformance exists because the realistic failure is a table gaining a
+	// tenant column, no policy, and nobody noticing. An exemption therefore
+	// has to be a deliberate, reviewed, written-down act rather than a
+	// silent omission — which is what this map is.
+	//
+	// The test to apply before adding an entry is not "does scoping it break
+	// something". It is: is this table read BEFORE a tenant is known, by a
+	// caller who could not possibly have named one yet? The tenant registry
+	// itself qualifies, because the statement that establishes the scope
+	// cannot require a scope. A table read after resolution has no business
+	// here, however convenient the exemption would be — and the convenient
+	// exemption is how a tenant table ends up unprotected.
+	Unscoped map[string]string
+}
+
+// WithDefaults fills in whatever the caller left blank.
+func (c Config) WithDefaults() Config {
+	if c.Setting == "" {
+		c.Setting = DefaultSetting
+	}
+	if c.Column == "" {
+		c.Column = DefaultColumn
+	}
+	return c
+}
 
 var (
 	// ErrPrivileged means the connected role bypasses row-level security, so
@@ -45,7 +98,7 @@ var (
 
 	// ErrNotIsolated means the self-test's scoping did not behave as
 	// transaction-local, which is what pooling in statement mode looks like.
-	ErrNotIsolated = errors.New("rls: the workspace setting is not transaction-local")
+	ErrNotIsolated = errors.New("rls: the tenant setting is not transaction-local")
 
 	// ErrBadIdentifier means a table name was not usable in DDL.
 	ErrBadIdentifier = errors.New("rls: unusable identifier")
@@ -83,8 +136,9 @@ func PolicyName(table string) string { return table + "_tenant" }
 //     forgetting to scope is therefore "no data", not "all data".
 //   - a value that is not a uuid fails the cast and errors the statement,
 //     which is also closed.
-func Predicate() string {
-	return TenantColumn + " = nullif(current_setting('" + GUC + "', true), '')::uuid"
+func (c Config) Predicate() string {
+	c = c.WithDefaults()
+	return c.Column + " = nullif(current_setting('" + c.Setting + "', true), '')::uuid"
 }
 
 // Enable turns on row-level security for a table and installs its policy.
@@ -92,12 +146,12 @@ func Predicate() string {
 // Call it as the last statement of the migration that creates the table.
 // Migrations take a *sql.Tx and PostgreSQL DDL is transactional, so this
 // either all applies or none of it does.
-func Enable(tx *sql.Tx, table string) error {
+func (c Config) Enable(tx *sql.Tx, table string) error {
 	quoted, err := quote(table)
 	if err != nil {
 		return err
 	}
-	for _, statement := range enableStatements(table, quoted) {
+	for _, statement := range c.enableStatements(table, quoted) {
 		if _, err := tx.Exec(statement); err != nil {
 			return fmt.Errorf("rls: enabling on %s: %w", table, err)
 		}
@@ -105,7 +159,7 @@ func Enable(tx *sql.Tx, table string) error {
 	return nil
 }
 
-func enableStatements(table, quoted string) []string {
+func (c Config) enableStatements(table, quoted string) []string {
 	return []string{
 		"ALTER TABLE " + quoted + " ENABLE ROW LEVEL SECURITY",
 
@@ -119,14 +173,14 @@ func enableStatements(table, quoted string) []string {
 		//
 		// USING governs which rows SELECT, UPDATE and DELETE can see. WITH
 		// CHECK governs what INSERT may write AND the post-image of an
-		// UPDATE — so without it a row can be MOVED to another workspace by
+		// UPDATE — so without it a row can be MOVED to another tenant by
 		// an update that the USING clause happily permits, because it only
 		// checked the row's state before the change. That is the quiet hole
 		// in most row-level security write-ups.
 		"CREATE POLICY " + PolicyName(table) + " ON " + quoted +
 			" AS PERMISSIVE FOR ALL TO PUBLIC" +
-			" USING (" + Predicate() + ")" +
-			" WITH CHECK (" + Predicate() + ")",
+			" USING (" + c.Predicate() + ")" +
+			" WITH CHECK (" + c.Predicate() + ")",
 	}
 }
 
@@ -154,21 +208,21 @@ func force(tx *sql.Tx, table string, on bool) error {
 	return err
 }
 
-// SetLocal tells the database which workspace this transaction is for.
+// SetLocal tells the database which tenant this transaction is for.
 //
 // This is the ONLY place in the codebase that writes the setting, and the
 // third argument to set_config is true, meaning transaction-local: PostgreSQL
 // resets it at COMMIT or ROLLBACK. That is what makes the whole arrangement
 // safe under connection pooling — a connection handed back to the pool
-// carries no workspace, so the next request cannot inherit one.
+// carries no tenant, so the next request cannot inherit one.
 //
-// A session-level SET, or set_config(..., false), would leak the workspace to
+// A session-level SET, or set_config(..., false), would leak the tenant to
 // whoever gets that connection next. It would also appear to work perfectly
 // in development, under one connection and one user.
-func SetLocal(ctx context.Context, exec interface {
+func (c Config) SetLocal(ctx context.Context, exec interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}, workspaceID string) error {
-	return SetLocalFunc(ctx, exec.ExecContext, workspaceID)
+}, tenantID string) error {
+	return c.SetLocalFunc(ctx, exec.ExecContext, tenantID)
 }
 
 // SetLocalFunc is SetLocal for a handle whose method is spelled differently.
@@ -179,12 +233,21 @@ func SetLocal(ctx context.Context, exec interface {
 // places in the codebase generating it — and the whole value of there being
 // one is that `rg set_config` finds every writer, and that none of them can
 // quietly pass false for the third argument.
-func SetLocalFunc(ctx context.Context,
+func (c Config) SetLocalFunc(ctx context.Context,
 	exec func(context.Context, string, ...any) (sql.Result, error),
-	workspaceID string) error {
-	_, err := exec(ctx, "SELECT set_config($1, $2, true)", GUC, workspaceID)
+	tenantID string) error {
+	_, err := exec(ctx, SetLocalStatement, c.WithDefaults().Setting, tenantID)
 	return err
 }
+
+// SetLocalStatement is the statement both writers emit.
+//
+// There are two, and that is deliberate rather than an oversight: this
+// package speaks database/sql, for migrations and fixtures that have no ORM,
+// while the request path goes through orm.SetTenantSetting, which asks the
+// dialect. A test asserts the two produce the same SQL, so the one place they
+// could drift apart is guarded.
+const SetLocalStatement = "SELECT set_config($1, $2, true)"
 
 // AssertNotPrivileged refuses to continue when the connected role bypasses
 // row-level security.
@@ -213,13 +276,14 @@ func AssertNotPrivileged(ctx context.Context, db *sql.DB) error {
 }
 
 // SelfTest proves, against the live database and its pooler, that the
-// workspace setting behaves as transaction-local.
+// tenant setting behaves as transaction-local.
 //
 // Run it at boot. It converts the one piece of infrastructure that can
 // silently destroy the design — a connection pooler in statement mode, where
 // a transaction cannot span statements — from an undetectable
 // misconfiguration into a startup failure.
-func SelfTest(ctx context.Context, db *sql.DB) error {
+func (c Config) SelfTest(ctx context.Context, db *sql.DB) error {
+	cfg := c.WithDefaults()
 	const sentinel = "00000000-0000-0000-0000-00000000dead"
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -228,7 +292,7 @@ func SelfTest(ctx context.Context, db *sql.DB) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := SetLocal(ctx, tx, sentinel); err != nil {
+	if err := c.SetLocal(ctx, tx, sentinel); err != nil {
 		return fmt.Errorf("rls: self-test could not scope: %w", err)
 	}
 
@@ -237,7 +301,7 @@ func SelfTest(ctx context.Context, db *sql.DB) error {
 	for i := range 2 {
 		var got string
 		if err := tx.QueryRowContext(ctx,
-			"SELECT coalesce(current_setting($1, true), '')", GUC).Scan(&got); err != nil {
+			"SELECT coalesce(current_setting($1, true), '')", cfg.Setting).Scan(&got); err != nil {
 			return fmt.Errorf("rls: self-test read %d: %w", i, err)
 		}
 		if got != sentinel {
@@ -256,7 +320,7 @@ func SelfTest(ctx context.Context, db *sql.DB) error {
 	// made session-wide and leaks across requests.
 	var leaked string
 	if err := db.QueryRowContext(ctx,
-		"SELECT coalesce(current_setting($1, true), '')", GUC).Scan(&leaked); err != nil {
+		"SELECT coalesce(current_setting($1, true), '')", cfg.Setting).Scan(&leaked); err != nil {
 		return fmt.Errorf("rls: self-test leak check: %w", err)
 	}
 	if leaked != "" {
@@ -268,48 +332,14 @@ func SelfTest(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// Unscoped names the tables that carry a workspace_id and deliberately have
-// no policy, with the reason for each.
-//
-// # Why an exemption list exists at all
-//
-// The conformance check below exists because the realistic failure is a
-// table gaining a workspace_id, no policy, and nobody noticing. An exemption
-// therefore has to be a deliberate, reviewed, written-down act rather than a
-// silent omission — which is what this map is: `rg Unscoped` finds every one
-// of them, and adding an entry is a diff somebody has to justify.
-//
-// # Why these two qualify
-//
-// Both are the REGISTRY: they are read in order to decide which workspace a
-// request is about, and by whom, before any workspace is bound. A policy on
-// them would be circular — the statement that establishes the scope cannot
-// itself require a scope — and the circularity does not fail loudly, it
-// answers "no such workspace" to everybody, forever.
-//
-// The test to apply before adding a third entry is not "does scoping it
-// break something". It is: is this table read BEFORE a workspace is known,
-// by a caller who could not possibly have named one yet? A table read after
-// resolution has no business here, however convenient the exemption would
-// be — and the convenient exemption is exactly how a tenant table ends up
-// unprotected.
-func Unscoped() map[string]string {
-	return map[string]string{
-		"workspaces": "the tenant table itself: a row in it cannot be scoped " +
-			"to the workspace it defines",
-		"workspace_owners": "the console reads every workspace one superuser " +
-			"owns, which is a question about no single workspace and so cannot " +
-			"be asked from inside one",
-	}
-}
-
 // Conformance reports tenant-scoped tables whose protection is not what this
 // package installs.
 //
 // The realistic failure is not a broken policy; it is a table added with a
-// workspace_id column, no policy and nobody noticing, at which point that
+// tenant_id column, no policy and nobody noticing, at which point that
 // table has no isolation and nothing fails. Run this in CI.
-func Conformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
+func (c Config) Conformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
+	cfg := c.WithDefaults()
 	rows, err := db.QueryContext(ctx, `
 		SELECT c.relname,
 		       c.relrowsecurity,
@@ -326,13 +356,13 @@ func Conformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
 		   AND n.nspname = 'public'
 		   AND EXISTS (SELECT 1 FROM pg_attribute a
 		                WHERE a.attrelid = c.oid AND a.attname = $1 AND a.attnum > 0 AND NOT a.attisdropped)
-		 ORDER BY c.relname`, TenantColumn)
+		 ORDER BY c.relname`, cfg.Column)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	unscoped := Unscoped()
+	unscoped := cfg.Unscoped
 
 	var findings []Finding
 	for rows.Next() {
@@ -349,13 +379,13 @@ func Conformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
 		}
 		switch {
 		case !f.Enabled:
-			f.Problem = "has a " + TenantColumn + " column but row-level security is not enabled"
+			f.Problem = "has a " + cfg.Column + " column but row-level security is not enabled"
 		case !f.Forced:
 			f.Problem = "row-level security is enabled but not FORCEd, so the table owner bypasses it"
 		case f.Policies != 1:
 			f.Problem = fmt.Sprintf("has %d policies; expected exactly one", f.Policies)
 		case withCheck == "":
-			f.Problem = "its policy has no WITH CHECK, so a row can be moved to another workspace"
+			f.Problem = "its policy has no WITH CHECK, so a row can be moved to another tenant"
 		}
 		if f.Problem != "" {
 			findings = append(findings, f)
@@ -369,11 +399,12 @@ func Conformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
 //
 // The inverse mistake, and worth catching because its symptom is baffling:
 // an exempt table with a policy answers nothing to everybody — the console
-// would list no workspaces and resolution would 404 every host — while the
+// would list no tenants and resolution would 404 every host — while the
 // table looks correctly protected to anybody auditing it.
-func UnscopedConformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
+func (c Config) UnscopedConformance(ctx context.Context, db *sql.DB) ([]Finding, error) {
 	var findings []Finding
-	for table, reason := range Unscoped() {
+	cfg := c.WithDefaults()
+	for table, reason := range cfg.Unscoped {
 		var enabled bool
 		var policies int
 		err := db.QueryRowContext(ctx, `

@@ -1,85 +1,332 @@
 # tenancy
 
-Decides which workspace a request is about, and whether the caller may have it.
-
-Two steps, deliberately separate:
+Multi-tenancy for a Lemmego application: which tenant a request is about,
+whether the caller may have it, and a database that enforces the answer
+rather than trusting it.
 
 ```go
-ident, err := tenancy.Identify(r, hostCfg)              // which workspace is named?
-binding, err := tenancy.Authorize(ctx, reg, ident, who) // may this caller have it?
+import (
+    "github.com/lemmego/tenancy"
+    "github.com/lemmego/tenancy/provider"
+    "github.com/lemmego/tenancy/rls"
+)
 ```
 
-`binding.Workspace.ID` is then the one value every query, every row-level
-security policy and every cache key for that request is scoped by.
+Two layers, and the point of the package is that they are independent. The
+ORM carries an implicit predicate on every statement it builds; PostgreSQL
+carries a row-level security policy on every statement it executes. A
+cross-tenant read has to get past both, and a test that removes either one
+and still passes is a test proving the other works.
 
-## How a request names a workspace
+## How a request names a tenant
 
-| | Example | Trust |
-|---|---|---|
-| Host | `acme.fieldbubble.com` | Where the request actually went. A browser cannot forge it, and the session cookie is scoped to that exact host. |
-| `X-Workspace-User` | `acme` — the subdomain label | Client-supplied. |
-| `X-Workspace-ID` | `11111111-…` — the workspace uuid | Client-supplied. |
+Two ways, and the difference between them is most of this package.
 
-The host resolution compares **label depth** against one configured
-`APP_DOMAIN`, which is why `fieldbubble.localhost` and `fieldbubble.com`
-behave identically and there is no development branch anywhere. It also
-refuses `evil.acme.fieldbubble.com`, which a suffix test alone accepts and a
-naive prefix-strip then reads as the workspace `evil.acme` — or, worse, as
-`acme`.
+**The host.** `acme.example.com` names acme. A browser cannot forge this — it
+is where the request went, and the session cookie that came with it is scoped
+to that exact host.
 
-## A header selects. It does not authorise.
+**A header.** `X-Tenant-Slug: acme`, or `X-Tenant-ID: <uuid>`. For an API
+client with no per-tenant host, and for a mobile app that knows which tenant
+it signed into. Both names are configurable, because they are part of your
+public API: a product whose tenants are "workspaces" will want
+`X-Workspace-Slug`, and its clients are already sending it.
 
-This is the whole point of the package, so it is worth being blunt about.
+```go
+cfg := tenancy.Config{
+    Hostnames: hostname.Config{AppDomain: "example.com", Reserved: hostname.DefaultReserved()},
+    SlugHeader: "X-Workspace-Slug",   // optional; defaults to X-Tenant-Slug
+}
+identification, err := tenancy.Identify(request, cfg)
+```
 
-A request carrying `X-Workspace-User: globex` has said a word. On its own that
-word means nothing about whether the caller may see globex. If the tenant is
-taken from a header and handed straight to the query scope, then **any
-authenticated member of one workspace can read another by typing its name** —
-and the ORM's tenant predicate and the database's row-level security policy
-will both enforce that choice perfectly. The isolation machinery is not what
-protects you here; it is what faithfully carries out whatever it was told.
+### A header selects. It does not authorise.
 
-Using the slug instead of the uuid does not help. A slug is *more* guessable:
-it is public, it is in the URL, and it is usually the company's name.
+This is the part worth reading twice. A header is client-supplied, so on its
+own it says nothing about whether the caller may see that tenant. Taking the
+tenant from a header and scoping the query to it — with nothing else — means
+any authenticated member of one tenant can read another by typing its id, and
+**both** the ORM predicate and the row-level security policy will enforce
+that choice perfectly. The isolation machinery is not what protects you here.
 
-So `Authorize` derives the binding from the caller's **membership** of the
-resolved workspace, never from the name. Two consequences fall out:
+So `Identify` answers only "which tenant is this request *about*". The binding
+comes from the caller's **membership**:
 
-- A caller who names a workspace they do not belong to is refused with
-  `ErrNoWorkspace` — **the same error as a workspace that does not exist**. A
-  distinct "forbidden" would confirm which companies are customers and let
-  anybody enumerate the tenant list from a login page.
-- A header-named workspace requires an authenticated principal. A header with
-  nobody behind it is a string from the internet. A *host*-named workspace
-  still resolves anonymously, because a visitor has to reach the sign-in page.
+```go
+binding, err := tenancy.Authorize(ctx, registry, identification, principal)
+```
 
-## Rules `Identify` enforces before any lookup
+A caller who names a tenant they do not belong to gets `ErrNoTenant` — the
+same error as a tenant that does not exist, deliberately, because a distinct
+"forbidden" would confirm which companies are customers and let anybody
+enumerate the tenant list from a sign-in page.
 
-1. **The host decides the surface**, always: marketing, platform (`sys.`),
-   console (`app.`) or workspace.
-2. **At most one workspace header.** Both set is a client bug, and guessing
-   which was meant is how a client that sets them in two places reads the
-   wrong tenant for a month.
-3. **On a workspace host, a header must agree with the host.** A browser sends
-   acme's cookie to `acme.fieldbubble.com` automatically; if a header could
-   override the tenant from there, a page on acme could ask for globex with
-   acme's credentials attached. A slug is compared immediately; a uuid cannot
-   be compared without a lookup, so it travels as
-   `Identifier.MustAgreeWith` and `Authorize` settles it — refusing a
-   contradiction rather than resolving it in anyone's favour.
-4. **Shape is validated before the database.** A malformed slug or uuid is
-   refused up front, so nothing resembling SQL, a path or a cache-key
-   separator ever reaches a cache key.
+`Select` and `Confirm` are the two halves, for the case that forces them
+apart: a user lookup needs a tenant (the users table is scoped), and
+authorising needs the user that lookup produces. Resolve the host first,
+authorise after, with nothing bound in between.
 
-## Why `Source` is on the binding
+## Surfaces
 
-So the cache can key each source separately. Conflating a host-resolved entry
-with a header-resolved one lets a request on one host poison the other's
-answer, which is a tenant leak rather than a cache bug.
+`hostname` compares **label depth** against one configured domain, so
+`example.localhost` and `example.com` behave identically and there is no
+development branch to get wrong.
+
+| Host | Surface |
+|---|---|
+| `example.com` | `SurfaceMarketing` |
+| `sys.example.com` | `SurfacePlatform` |
+| `app.example.com` | `SurfaceConsole` |
+| `acme.example.com` | `SurfaceTenant`, slug `acme` |
+
+Both conditions in the match are needed, and the second is the one that
+matters: a suffix test alone accepts `evil.acme.example.com`, and a naive
+prefix-strip then reads the label as `evil.acme` — or, worse, somebody
+helpfully takes the first label and serves acme's data to a host acme does not
+control. Requiring exactly one more label than the app domain refuses the
+whole shape.
+
+`ValidateLabel` decides what may be **registered**, and it does so by
+building the host the label would answer on and asking `Resolve` what that
+host means. A label is registrable exactly when a host made from it resolves
+back to a tenant with that slug. That is the only arrangement in which
+creation and routing cannot drift — and the case a hand-written copy of the
+rules always misses is a configured surface label: set `ConsoleLabel: "portal"`
+and `portal` must become unregistrable, because `Resolve` answers the surface
+before it considers a tenant at all.
+
+## The database half
+
+`rls` emits and verifies PostgreSQL row-level security.
+
+```go
+security := rls.Config{Setting: "acme.tenant_id", Column: "tenant_id"}
+
+// In the migration that creates a tenant-scoped table, as its last statement:
+if err := security.Enable(tx, "invoices"); err != nil { return err }
+```
+
+That installs `ENABLE`, `FORCE` and one policy whose text is byte-identical
+across tables modulo the name — which is what lets a conformance check
+compare it as a string instead of parsing SQL. Three details carry the
+guarantee:
+
+- **`FORCE`**, so the table's owner is subject too. Without it the role that
+  runs migrations reads and writes across tenants, and that role is one
+  connection string away from being the application's.
+- **`WITH CHECK` as well as `USING`.** `USING` governs what you can *see*, so
+  without `WITH CHECK` a row can be **moved** to another tenant by an
+  `UPDATE` the `USING` clause happily permits — it only checked the row's
+  state before the change. That is the quiet hole in most RLS write-ups.
+- **`current_setting(…, true)` + `nullif`**, so an unset setting yields NULL,
+  and `tenant_id = NULL` is never true. It fails closed *by construction*:
+  the failure mode of forgetting to scope is "no data", not "all data".
+
+### Telling the database which tenant
+
+The ORM's `WithTenantEnter` hook runs as each tenant transaction opens, and
+`orm.SetTenantSetting` asks the dialect for the statement:
+
+```go
+db := orm.Open(sqlDB, orm.Postgres(),
+    orm.WithTenantEnter(orm.SetTenantSetting(security.Setting)))
+```
+
+It is **transaction-local**, so it resets at commit or rollback and cannot
+reach the next user of a pooled connection — which is what makes this safe
+behind a pooler in transaction mode. A session-level `SET` would leak the
+tenant and would look perfect in development, under one connection and one
+user.
+
+On MySQL or SQLite there is no equivalent, so there is nothing for a policy to
+read. `provider.Provider` refuses to boot on such a database unless you set
+`AllowUnenforced`, because an application that wired this package asked for
+isolation the database enforces, and silently getting one layer where you
+believed you had two is the failure this package exists to prevent.
+
+### Two checks to run at boot, in every environment
+
+```go
+rls.AssertNotPrivileged(ctx, db)   // the role is not a superuser and has no BYPASSRLS
+security.SelfTest(ctx, db)          // the setting really is transaction-local
+```
+
+The first matters because **a superuser bypasses row-level security entirely,
+and `FORCE` does not change that** — `FORCE` only subjects the table's owner.
+A developer's PostgreSQL role is usually a superuser, so without this check
+the policies are inert locally and every isolation test passes while proving
+nothing. The second converts the one infrastructure choice that would silently
+destroy the design — a pooler in *statement* mode — into a startup error.
+
+### Conformance
+
+The realistic failure is not a broken policy. It is a table that gains a
+tenant column, no policy, and nobody notices: tests pass, the page works, and
+a customer finds it.
+
+```go
+findings, _ := security.Conformance(ctx, db)
+if err := rls.FindingsError(findings); err != nil { return err }   // run this in CI
+```
+
+`Config.Unscoped` is the exemption list, and it exists so that an exemption is
+a deliberate, reviewed, written-down act rather than a silent omission. The
+test to apply before adding an entry is **not** "does scoping it break
+something". It is: is this table read *before* a tenant is known, by a caller
+who could not possibly have named one yet? The tenant registry itself
+qualifies — the statement that establishes the scope cannot require a scope.
+Anything read after resolution does not, however convenient the exemption
+would be.
+
+`UnscopedConformance` catches the inverse, whose symptom is baffling rather
+than loud: an exempt table that acquires a policy answers nothing to
+everybody, while looking correctly protected to anybody auditing it.
+
+## Models
+
+```go
+type Invoice struct {
+    tenancy.Scoped          // TenantID string `db:"tenant_id" orm:"column:tenant_id;tenantKey"`
+    ID    uint64 `db:"id" orm:"primaryKey;autoIncrement"`
+    Total int64  `db:"total_cents"`
+}
+```
+
+The embed declares the column, the tag and the type in one place, so there is
+nothing per-model to get subtly wrong, and `rg tenancy.Scoped` lists every
+scoped model — which is what lets a conformance check cross-check the models
+against the tables that actually carry a policy.
+
+**If your column is not `tenant_id`, declare your own four-line embed.** A
+struct tag is compile-time and cannot be configured, so this is the one thing
+`Config.Column` cannot do for you; set `Column` to match whatever you declare.
+
+The ORM detects the `tenantKey` tag and never the field name, deliberately: a
+naming convention would mean that renaming a field silently changes whether a
+table is isolated.
+
+## The registry
+
+Two questions, and your application answers both:
+
+```go
+type Registry interface {
+    Lookup(ctx context.Context, id Identifier) (Tenant, error)
+    IsMember(ctx context.Context, tenantID string, principal Principal) (bool, error)
+}
+```
+
+`pgstore` implements it over PostgreSQL. `Lookup` is uniform enough to
+configure — a table with an id, a slug, a name and a status — but membership
+is yours: which table holds it, and what a membership means for each
+population of caller, is not something a library can know. So you supply the
+query and `pgstore` supplies the thing that is easy to get wrong:
+
+```go
+store := pgstore.New(db, pgstore.Config{
+    Table: "workspaces",
+    RLS:   security,
+    Members: func(ctx context.Context, tx *sql.Tx, tenantID string, p tenancy.Principal) (bool, error) {
+        // tx is ALREADY scoped to tenantID, so this needs no tenant predicate
+        // and cannot see another tenant's rows.
+        var exists bool
+        err := tx.QueryRowContext(ctx,
+            `SELECT EXISTS (SELECT 1 FROM users WHERE id = $1::bigint AND active)`,
+            p.PrincipalKey()).Scan(&exists)
+        return exists, err
+    },
+})
+```
+
+The membership check opens its own short read-only transaction and scopes it.
+The obvious alternative is to run it through a role that bypasses the policy,
+and that is the wrong fix: it would put a `BYPASSRLS` connection on the
+authentication path of every single request, which is the one place it must
+never be.
+
+## Wiring
+
+```go
+&provider.Provider{
+    Config:   cfg,
+    RLS:      security,
+    Registry: store,
+    DB:       db,
+    Principal: func(c app.Context) (tenancy.Principal, bool) { … },
+}
+```
+
+Two middlewares, and the split is forced by *when things are known*:
+
+- **`resolve`** is an `app.HTTPMiddleware`, installed by `Provide` through
+  `Router().Use`, so it runs before the router matches a pattern — which it
+  must, because Go's `ServeMux` matches hosts exactly and cannot express a
+  wildcard subdomain, so a tenant host is not something the route table can
+  describe.
+- **`Scoped`** is an `app.Handler` on a route group. It runs *after*
+  authentication, which it must, because deciding whether the caller may have
+  that tenant needs to know who the caller is. It authorises, then opens the
+  request's tenant transaction.
+
+Putting both in one middleware is the mistake worth naming: an
+`HTTPMiddleware` runs for every request including `/build/app-abc123.js`, and
+opening a transaction per static asset is not a thing to do.
+
+`AssertSurface` guards a route group, answering **404 rather than 403** — so
+`sys.example.com` never confirms that a console route exists somewhere.
+
+`Provide` also refuses to start when `session.domain` is set. One cookie on
+`.example.com` is sent to every tenant subdomain, so acme's session would
+travel to globex and the per-subdomain isolation this whole design assumes
+would be gone — in one configuration value, silently, with every test still
+passing.
+
+## Reading values back
+
+```go
+tenancy.Identified(ctx)  // what resolve read: the surface, and the identifier
+provider.Selected(ctx)   // the tenant the host resolved to — NOT an authorisation
+provider.Current(ctx)    // the authorised tenant, set only inside Scoped
+provider.Tx(ctx)         // the request's tenant transaction
+```
+
+`Selected` says which tenant the request is *about*, which is what a user
+lookup needs in order to find anybody at all. `Current` is the one that means
+the caller may have it.
+
+**Do not reach `Tx` from an Inertia shared prop.** The renderer resolves each
+prop in its own goroutine and an `orm.Tx` is owned by one, so a prop that
+queries races every other prop. Read a value the middleware already computed.
 
 ## What this package does not do
 
-It has no database, no cache and no HTTP client, and imports nothing outside
-the standard library. The application supplies a `Registry`; `Lookup` and
-`IsMember` are the only two questions asked of it. Caching those answers, and
-invalidating them, belongs to the implementation.
+- **It does not know what a user is.** `Principal` is two strings, so this
+  package never learns what a password is or whether the caller is a person,
+  a device or a machine token.
+- **It does not cache.** `Lookup` runs per request. A cache belongs in front
+  of your `Registry`, keyed per source — conflating a host-resolved and a
+  header-resolved entry means one can poison the other, which is a tenant
+  leak rather than a cache bug, and `Binding.Source` is there so you can key
+  them apart.
+- **It does not filter `Raw` SQL or many-to-many pivot reads.** Neither does
+  the ORM, and for the same reason: there is nowhere to inject a predicate
+  into hand-written SQL, and a pivot is a bare table with no model and so no
+  declared tenant column. Both are row-level security's job, which is why it
+  is not optional.
+
+## Verification
+
+```sh
+export TENANCY_OWNER_DSN="postgres://owner@127.0.0.1:5432/tenancy_test?sslmode=disable"
+export TENANCY_APP_DSN="postgres://app@127.0.0.1:5432/tenancy_test?sslmode=disable"
+export TENANCY_SUPER_DSN="postgres://postgres@127.0.0.1:5432/tenancy_test?sslmode=disable"
+go test ./... -count=1 -race -v
+```
+
+Three roles, because the suite proves the difference between them: `app` is
+subject to every policy, `owner` owns the tables and is *still* subject
+because `FORCE` says so, and the superuser bypasses them — which is what
+`TestASuperuserBypassesEverythingWhichIsWhyTheRoleMatters` exists to
+demonstrate. Without the DSNs the database half skips, and the skip message
+says what is unverified: a suite that skips and a suite that passes share an
+exit code.
