@@ -173,7 +173,7 @@ discovered at the first request.
 
 ```go
 rls.AssertNotPrivileged(ctx, db)   // the role is not a superuser and has no BYPASSRLS
-security.SelfTest(ctx, db)          // the setting really is transaction-local
+cfg.SelfTest(ctx, db)               // the setting really is transaction-local
 ```
 
 The first matters because **a superuser bypasses row-level security entirely,
